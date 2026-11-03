@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from docx import Document
-from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_TAB_ALIGNMENT
 from docx.shared import Inches, Pt, RGBColor
 
 from src.masterdeorca import database
@@ -148,6 +148,11 @@ def get_blueprint(blueprint_id: str) -> dict | None:
 
 
 def save_blueprint(value: dict, *, create: bool = False) -> dict:
+    value = dict(value or {})
+    if not value.get("blueprint_id"):
+        value["blueprint_id"] = uuid.uuid4().hex
+    # Custom blueprints are never the canonical default, regardless of client input.
+    value["is_default"] = False
     row = validate_blueprint(value)
     if row["blueprint_id"] == DEFAULT_BLUEPRINT_ID:
         raise ValueError("The built-in default blueprint cannot be replaced or deleted")
@@ -215,26 +220,53 @@ def _is_type(question: dict, requested: str | None) -> bool:
     return isinstance(actual, str) and actual.casefold() == requested.casefold()
 
 
+from docx.oxml import OxmlElement
+from docx.oxml.ns import qn
+
+
+def _add_horizontal_rule(paragraph) -> None:
+    p = paragraph._p
+    pPr = p.get_or_add_pPr()
+    pbdr = OxmlElement("w:pBdr")
+    bottom = OxmlElement("w:bottom")
+    bottom.set(qn("w:val"), "single")
+    bottom.set(qn("w:sz"), "6")
+    bottom.set(qn("w:space"), "1")
+    bottom.set(qn("w:color"), "000000")
+    pbdr.append(bottom)
+    pPr.append(pbdr)
+
+
 def _docx(paper: dict, target: Path) -> None:
     doc = Document()
     section = doc.sections[0]
-    section.top_margin = section.bottom_margin = Inches(0.7)
-    section.left_margin = section.right_margin = Inches(0.85)
+    section.top_margin = section.bottom_margin = Inches(1)
+    section.left_margin = section.right_margin = Inches(1)
     normal = doc.styles["Normal"]
-    normal.font.name = "Aptos"
-    normal.font.size = Pt(11)
+    normal.font.name = "Times New Roman"
+    normal.font.size = Pt(12)
+    normal.font.color.rgb = RGBColor(0, 0, 0)
+    for style_name, size in (("Heading 1", 14), ("Heading 2", 12)):
+        try:
+            style = doc.styles[style_name]
+            style.font.name = "Times New Roman"
+            style.font.size = Pt(size)
+            style.font.color.rgb = RGBColor(0, 0, 0)
+            style.font.bold = True
+        except KeyError:
+            pass
     for value in (paper.get("university_name"), paper.get("college_name"), paper.get("department_name")):
         if value:
             p = doc.add_paragraph()
             p.alignment = WD_ALIGN_PARAGRAPH.CENTER
             r = p.add_run(value)
             r.bold = True
-            r.font.size = Pt(12)
+            r.font.size = Pt(16)
     heading = doc.add_paragraph()
     heading.alignment = WD_ALIGN_PARAGRAPH.CENTER
     run = heading.add_run(paper["title"])
     run.bold = True
-    run.font.size = Pt(18)
+    run.font.size = Pt(14)
     meta = doc.add_paragraph()
     meta.alignment = WD_ALIGN_PARAGRAPH.CENTER
     subject_label = paper.get("subject_name") or paper["subject"]
@@ -250,30 +282,38 @@ def _docx(paper: dict, target: Path) -> None:
     if paper.get("academic_year") or paper.get("semester") or paper.get("examination_date"):
         meta.add_run("\n")
     meta.add_run(f"Maximum marks: {paper['requested_total_marks']}  |  Duration: {paper['duration']}")
-    doc.add_heading("Instructions", level=2)
-    for instruction in paper["instructions"]:
-        doc.add_paragraph(instruction, style="List Number")
 
-    # Mandatory processing accuracy notice. Rendered server-side for every
-    # generated paper, immediately after the examination details and instructions
-    # and before the questions, exactly once. Black text only; structural
-    # distinction comes from heading/bold styling, never colour.
-    _add_processing_accuracy_notice(doc)
+    # Horizontal separator.
+    separator = doc.add_paragraph()
+    separator.paragraph_format.space_after = Pt(6)
+    _add_horizontal_rule(separator)
+
+    if paper.get("instructions"):
+        doc.add_heading("Instructions", level=2)
+        for instruction in paper["instructions"]:
+            doc.add_paragraph(instruction, style="List Number")
 
     print_number = 1
     reference_rows = []
     for section_data in paper["sections"]:
-        doc.add_heading(section_data["name"], level=2)
+        section_name = str(section_data.get("name") or "").strip()
+        if not section_name.upper().startswith("SECTION "):
+            section_heading = f"SECTION {section_name}".strip()
+        else:
+            section_heading = section_name.upper()
+        doc.add_heading(section_heading, level=2)
         if section_data.get("instructions"):
             doc.add_paragraph(section_data["instructions"])
         for item in section_data["questions"]:
             p = doc.add_paragraph()
             p.paragraph_format.space_after = Pt(8)
+            p.paragraph_format.tab_stops.add_tab_stop(Inches(6.5), WD_TAB_ALIGNMENT.RIGHT)
             label = p.add_run(f"{print_number}. ")
             print_number += 1
             label.bold = True
             p.add_run(item["text"])
-            marks = p.add_run(f"  [{item['marks']} marks]")
+            p.add_run("\t")
+            marks = p.add_run(f"[{item['marks']} Marks]")
             marks.bold = True
             provenance = []
             if item.get("source_pdf"):
@@ -299,8 +339,6 @@ def _docx(paper: dict, target: Path) -> None:
                     try:
                         doc.add_picture(str(asset_path), width=Inches(4.8))
                     except Exception:
-                        # An unavailable or unsupported extraction asset must not
-                        # prevent delivery of the otherwise valid question paper.
                         pass
             for table in item.get("tables", []):
                 if not isinstance(table, dict):
@@ -318,11 +356,17 @@ def _docx(paper: dict, target: Path) -> None:
                         cells = word_table.add_row().cells
                         for cell, value in zip(cells, row):
                             cell.text = str(value)
+
+    # Processing Accuracy Notice, after questions.
+    _add_processing_accuracy_notice(doc)
+
+    # References / Sources, after the notice.
     if reference_rows:
         doc.add_page_break()
         doc.add_heading("References / Sources", level=1)
         for number, reference in reference_rows:
             doc.add_paragraph(f"Q{number} | {reference}")
+
     target.parent.mkdir(parents=True, exist_ok=True)
     # Atomic publication: fully render and verify the package on a temporary
     # file in the same directory, then swap it into place under its final ID.
@@ -359,11 +403,9 @@ def generate_paper(*, title: str, subject_id: str, exam_type: str, total_marks: 
                 and _question_text(q) and (marks is None or _marks(q) == marks) and _is_type(q, question_type)]
 
     def order(pool: list[dict]) -> list[dict]:
-        rng.shuffle(pool)
-        # Saved priority is always honored. The random shuffle is stable within
-        # each priority tier, so equal-priority questions remain randomized.
-        pool.sort(key=lambda q: priorities.get(str(q["question_id"]), 1), reverse=True)
-        return pool
+        # Preserve the Question Bank's stored order; do not reorder by priority,
+        # marks, page, ID or any other derived key.
+        return list(pool)
 
     if blueprint.get("auto_select"):
         pool = candidates(None, None)
@@ -801,6 +843,46 @@ def update_draft_question(draft_id: str, question_id: str, changes: dict) -> dic
         for section in draft["sections"]:
             section["question_count"] = len(section["questions"])
     return _mutate_draft(draft_id, mutate)
+
+
+def regenerate_draft_question(draft_id: str, question_id: str) -> dict:
+    """Replace one draft question with an unused bank question of the same marks."""
+    draft = get_draft(draft_id)
+    if draft is None:
+        raise KeyError(draft_id)
+    location = None
+    for section in draft.get("sections", []):
+        for index, question in enumerate(section.get("questions", [])):
+            if str(question.get("question_id")) == str(question_id):
+                location = (section, index, question)
+    if location is None:
+        raise KeyError(question_id)
+    section, index, old_question = location
+    marks = old_question.get("marks")
+    used_ids = {
+        str(question.get("question_id"))
+        for other_section in draft.get("sections", [])
+        for question in other_section.get("questions", [])
+        if question.get("question_id") and str(question.get("question_id")) != str(question_id)
+    }
+    pool = [
+        candidate for candidate in question_bank.read_subject(draft["subject"])
+        if _marks(candidate) == marks
+        and _question_text(candidate)
+        and str(candidate.get("question_id")) not in used_ids
+    ]
+    if not pool:
+        raise ValueError("No replacement question is available for this slot")
+    replacement = pool[0]
+    priorities = question_priorities.get_priorities({str(replacement.get("question_id"))})
+    new_question = _paper_question(replacement, old_question.get("number", index + 1), priorities)
+    new_question["number"] = old_question.get("number", index + 1)
+    section["questions"][index] = new_question
+    _validate_draft_totals(draft, enforce_total=False)
+    for current_section in draft["sections"]:
+        current_section["question_count"] = len(current_section["questions"])
+    _save_draft(draft)
+    return new_question
 
 
 def remove_draft_question(draft_id: str, question_id: str) -> dict:

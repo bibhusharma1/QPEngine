@@ -99,6 +99,10 @@ _cors = list(app_settings.CORS_ORIGINS)
 _env = os.environ.get("QUES_CORS_ORIGINS", "")
 if _env:
     _cors = [o.strip() for o in _env.split(",") if o.strip()]
+# Ensure local origins are always allowed
+for _o in ["http://localhost", "http://localhost:3000", "http://127.0.0.1", "http://127.0.0.1:3000", "http://localhost:5173", "http://127.0.0.1:5173"]:
+    if _o not in _cors:
+        _cors.append(_o)
 app.add_middleware(CORSMiddleware, allow_origins=_cors, allow_credentials=True, allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"], allow_headers=["Authorization", "Content-Type", "Accept", "Accept-Language", "Content-Language"])
 _active_jobs: set[tuple[str, str]] = set()
 _active_lock = threading.Lock()
@@ -1010,6 +1014,18 @@ def remove_draft_question(draft_id: str, question_id: str,
         return question_papers_service.remove_draft_question(draft_id, question_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="Draft or question not found") from exc
+
+
+@app.post("/api/question-papers/drafts/{draft_id}/questions/{question_id}/regenerate", tags=["question papers"])
+def regenerate_draft_question(draft_id: str, question_id: str,
+                             user: Annotated[str, Depends(require_write_user)]) -> dict:
+    _require_draft(user, draft_id)
+    try:
+        return question_papers_service.regenerate_draft_question(draft_id, question_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Draft or question not found") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 @app.put("/api/question-papers/drafts/{draft_id}/question-order", tags=["question papers"])

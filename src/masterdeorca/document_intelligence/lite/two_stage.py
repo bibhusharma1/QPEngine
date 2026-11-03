@@ -793,15 +793,22 @@ def _apply_explicit_question_boundaries(
                 f"({match.group(2).lower()})" if match.group(2) else None,
             ))
     if not headings:
-        return candidates
-
+        return [
+            candidate for candidate in candidates
+            if str(candidate.get("text") or "").strip()
+            or (candidate.get("sub_questions") or [])
+        ]
     explicit_question_keys = {
         re.sub(r"[^a-z0-9]", "", question_number.casefold())
         for _, question_number, sub_label in headings
         if sub_label is not None
     }
     if not explicit_question_keys:
-        return candidates
+        return [
+            candidate for candidate in candidates
+            if str(candidate.get("text") or "").strip()
+            or (candidate.get("sub_questions") or [])
+        ]
     candidate_by_number = {
         re.sub(
             r"[^a-z0-9]",
@@ -945,6 +952,13 @@ def _apply_explicit_question_boundaries(
             }.values())
 
     candidates.extend(recovered.values())
+    # Drop placeholder candidates that carry no question text and no subquestions;
+    # they only produce empty Question Bank rows.
+    candidates = [
+        candidate for candidate in candidates
+        if str(candidate.get("text") or "").strip()
+        or (candidate.get("sub_questions") or [])
+    ]
     for key in explicit_question_keys:
         candidate = candidate_by_number.get(key) or recovered.get(key)
         if candidate is None:
@@ -957,7 +971,11 @@ def _apply_explicit_question_boundaries(
                 *(candidate.get("ambiguity_notes") or []),
                 "Explicit question headings recovered block boundaries omitted by the classifier.",
             ]))
-    return candidates
+    return [
+        candidate for candidate in candidates
+        if str(candidate.get("text") or "").strip()
+        or (candidate.get("sub_questions") or [])
+    ]
 
 
 def _build_question_record(

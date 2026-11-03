@@ -310,11 +310,16 @@ def sync_from_parsed(subject: str, parsed_json: Path | str | bytes, source_pdf: 
     if not source_pdf:
         source_pdf = parsed_json.parent.name if isinstance(parsed_json, Path) else "unknown"
     rows = _flatten_records(subject, str(source_pdf), questions, [])
+    # Never synchronize empty question records created by failed/partial parsing.
+    rows = [row for row in rows if _record_text(row).strip()]
     rows = [row for row in rows if _importable(row)]
     path = bank_path(subject)
     with _locked(path):
         bank = _read_bank(subject, path)
-        existing_rows = bank["questions"]
+        existing_rows = [
+            row for row in bank["questions"]
+            if isinstance(row, dict) and _record_text(row).strip()
+        ]
         by_id: dict[str, int] = {}
         by_signature: dict[str, int] = {}
         for position, row in enumerate(existing_rows):
