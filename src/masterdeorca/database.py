@@ -28,20 +28,17 @@ def _get_connection():
         if not url:
             raise RuntimeError("TURSO_DATABASE_URL must be set for Turso backend")
         try:
-            import libsql_experimental as libsql  # type: ignore
-        except Exception:
-            try:
-                import libsql_client as libsql  # type: ignore
-            except Exception:
-                try:
-                    import libsql  # type: ignore
-                except Exception as e:
-                    raise RuntimeError(f"libSQL client not available: {e}")
+            import libsql  # type: ignore
+        except Exception as e:
+            raise RuntimeError(f"libSQL client not available: {e}")
         if token:
             try:
                 return libsql.connect(url, auth_token=token)
             except TypeError:
-                return libsql.connect(url, authToken=token)
+                try:
+                    return libsql.connect(url, auth_token=token)
+                except Exception:
+                    return libsql.connect(url)
         return libsql.connect(url)
     # Fallback to local SQLite if explicitly needed (not for Render)
     db_path = getattr(settings, "DATABASE_PATH", "/data/masterdeorca.sqlite")
@@ -108,17 +105,20 @@ def initialize() -> None:
 
 
 def _init_schema(db) -> None:
-        db.execute("""CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT, email TEXT NOT NULL UNIQUE,
-            name TEXT NOT NULL, hashed_password TEXT NOT NULL, role TEXT NOT NULL,
-            status TEXT NOT NULL DEFAULT 'active', department TEXT, created_at TEXT NOT NULL,
-            totp_secret_encrypted TEXT,
-            totp_enabled INTEGER NOT NULL DEFAULT 0,
-            totp_enrolled INTEGER NOT NULL DEFAULT 0,
-            totp_failed_attempts INTEGER NOT NULL DEFAULT 0,
-            totp_cooldown_until TEXT,
-            totp_last_used_step TEXT
-        )""")
+        try:
+            db.execute("""CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, email TEXT NOT NULL UNIQUE,
+                name TEXT NOT NULL, hashed_password TEXT NOT NULL, role TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'active', department TEXT, created_at TEXT NOT NULL,
+                totp_secret_encrypted TEXT,
+                totp_enabled INTEGER NOT NULL DEFAULT 0,
+                totp_enrolled INTEGER NOT NULL DEFAULT 0,
+                totp_failed_attempts INTEGER NOT NULL DEFAULT 0,
+                totp_cooldown_until TEXT,
+                totp_last_used_step TEXT
+            )""")
+        except Exception:
+            pass
         # Add columns if they don't exist (for migration)
         try:
             db.execute("ALTER TABLE users ADD COLUMN totp_secret_encrypted TEXT")

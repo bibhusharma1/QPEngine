@@ -17,4 +17,4 @@ COPY pipeline_runner.py ./pipeline_runner.py
 COPY scripts ./scripts
 
 EXPOSE 8000
-CMD ["sh", "-c", "uvicorn src.masterdeorca.app:app --host 0.0.0.0 --port ${PORT:-8000}"]
+CMD ["/bin/sh", "-c", "exec /app/.venv/bin/python -m uvicorn src.masterdeorca.app:app --host 0.0.0.0 --port ${PORT:-8000}"]

@@ -10,10 +10,25 @@ from __future__ import annotations
 import sqlite3
 
 
-def add_column_if_missing(db: sqlite3.Connection, table: str, column: str, definition: str) -> None:
-    columns = {row["name"] for row in db.execute(f"PRAGMA table_info({table})").fetchall()}
-    if column not in columns:
-        db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+def add_column_if_missing(db, table: str, column: str, definition: str) -> None:
+    try:
+        rows = db.execute(f"PRAGMA table_info({table})").fetchall()
+        columns = set()
+        for row in rows:
+            try:
+                if isinstance(row, dict):
+                    columns.add(row.get("name"))
+                elif hasattr(row, "keys") and "name" in row.keys():
+                    columns.add(row["name"])
+                else:
+                    # tuple format
+                    columns.add(row[1])
+            except Exception:
+                continue
+        if column not in columns:
+            db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+    except Exception:
+        pass
 
 
 def _migrate_teacher_subjects(db: sqlite3.Connection) -> None:
