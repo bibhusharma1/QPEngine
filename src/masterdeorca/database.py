@@ -52,6 +52,25 @@ def _get_connection():
     return db
 
 
+def _row_factory(cursor, row):
+    try:
+        import sqlite3
+        if hasattr(sqlite3, 'Row'):
+            return sqlite3.Row(cursor, row)
+    except Exception:
+        pass
+    # Fallback: dict-like access
+    try:
+        if cursor.description:
+            d = {}
+            for idx, col in enumerate(cursor.description):
+                d[col[0]] = row[idx]
+            return d
+    except Exception:
+        pass
+    return row
+
+
 def connect():
     backend = getattr(settings, "DATABASE_BACKEND", "turso").casefold()
     if backend == "turso":
@@ -62,9 +81,16 @@ def connect():
         except Exception:
             pass
         try:
-            db.row_factory = sqlite3.Row  # best effort
+            try:
+                import sqlite3
+                db.row_factory = sqlite3.Row
+            except Exception:
+                db.row_factory = _row_factory
         except Exception:
-            pass
+            try:
+                db.row_factory = _row_factory
+            except Exception:
+                pass
         return db
     # sqlite fallback
     db_path = getattr(settings, "DATABASE_PATH", "/data/masterdeorca.sqlite")
@@ -89,6 +115,11 @@ def initialize() -> None:
             except Exception:
                 pass
             _init_schema(db)
+            try:
+                from src.masterdeorca import migrations
+                migrations.run_migrations(db)
+            except Exception:
+                pass
         finally:
             try:
                 db.close()
@@ -102,6 +133,11 @@ def initialize() -> None:
         pragma_db.execute("PRAGMA synchronous=NORMAL")
     with connect() as db:
         _init_schema(db)
+        try:
+            from src.masterdeorca import migrations
+            migrations.run_migrations(db)
+        except Exception:
+            pass
 
 
 def _init_schema(db) -> None:
@@ -218,22 +254,63 @@ def _init_schema(db) -> None:
                        (ADMIN_EMAIL, "Administrator", _password_hash.hash(ADMIN_PASSWORD), "admin", "active", datetime.now(timezone.utc).isoformat()))
 
 
+def _get_row_value(row, key):
+    if row is None:
+        return None
+    try:
+        # dict-like
+        if isinstance(row, dict):
+            return row.get(key)
+        # sqlite3.Row or similar
+        try:
+            return row[key]
+        except Exception:
+            pass
+        # tuple
+        try:
+            if hasattr(row, 'keys'):
+                keys = row.keys()
+                if key in keys:
+                    return row[key]
+        except Exception:
+            pass
+    except Exception:
+        pass
+    return None
+
+
 def ensure_subject_record(db: Any, subject_name: str) -> str:
     """Return a stable database subject ID, creating a record for an explicit subject."""
     now = datetime.now(timezone.utc).isoformat()
     subject_id = str(uuid.uuid5(_SUBJECT_ID_NAMESPACE, f"subject/{subject_name}"))
-    db.execute(
-        "INSERT OR IGNORE INTO subjects(subject_id,subject_name,created_at,updated_at) "
-        "VALUES(?,?,?,?)",
-        (subject_id, subject_name, now, now),
-    )
-    row = db.execute(
-        "SELECT subject_id FROM subjects WHERE subject_name=?",
-        (subject_name,),
-    ).fetchone()
+    try:
+        db.execute(
+            "INSERT OR IGNORE INTO subjects(subject_id,subject_name,created_at,updated_at) "
+            "VALUES(?,?,?,?)",
+            (subject_id, subject_name, now, now),
+        )
+    except Exception:
+        pass
+    try:
+        row = db.execute(
+            "SELECT subject_id FROM subjects WHERE subject_name=?",
+            (subject_name,),
+        ).fetchone()
+    except Exception:
+        row = None
     if row is None:
         raise RuntimeError(f"Unable to register subject {subject_name!r}.")
-    return str(row["subject_id"])
+    val = _get_row_value(row, "subject_id")
+    if val is None:
+        # try tuple
+        try:
+            if isinstance(row, (tuple, list)):
+                val = row[0]
+        except Exception:
+            pass
+    if val is None:
+        raise RuntimeError(f"Unable to register subject {subject_name!r}.")
+    return str(val)
 
 
 def get_subject_id(subject_name: str) -> str | None:

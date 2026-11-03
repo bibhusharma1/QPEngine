@@ -27,6 +27,7 @@ dependencies = [
     "pyotp>=2.9.0",
     "cryptography>=42.0.0",
     "qrcode>=8.0",
+    "libsql>=0.1.11",
 ]
 
 [dependency-groups]
