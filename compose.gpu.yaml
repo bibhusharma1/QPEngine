@@ -1,6 +1,0 @@
-services:
-  masterdeorca:
-    build:
-      args:
-        INSTALL_OCR_GPU: "true"
-    gpus: all

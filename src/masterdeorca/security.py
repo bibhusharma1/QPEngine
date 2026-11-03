@@ -96,14 +96,39 @@ def subject_allowed(email: str, subject_id: str | None) -> bool:
 
 
 def require_subject_access(email: str, subject: str) -> None:
-    """Raise 403 when a teacher has not been assigned this subject."""
+    """Raise 403 when a non-admin has not been assigned this subject."""
+    from src.masterdeorca import database
+    user = database.get_user_by_email(email)
+    if user and user.get("role") == "admin":
+        return
     allowed = accessible_subjects(email)
+    # Also check new assignment system
+    try:
+        user_subjects = database.get_user_subjects_by_email(email)
+        assigned_set = {u["subject_name"] for u in user_subjects}
+        if assigned_set:
+            if subject not in assigned_set:
+                raise HTTPException(status_code=403, detail="Subject access is not assigned to this account")
+            return
+    except Exception:
+        pass
     if allowed is not None and subject not in allowed:
         raise HTTPException(status_code=403, detail="Subject access is not assigned to this account")
 
 
 def filter_subjects(email: str, subjects: list[str]) -> list[str]:
     """Restrict a subject listing to what the principal may see."""
+    from src.masterdeorca import database
+    user = database.get_user_by_email(email)
+    if user and user.get("role") == "admin":
+        return list(subjects)
+    try:
+        user_subjects = database.get_user_subjects_by_email(email)
+        assigned_set = {u["subject_name"] for u in user_subjects}
+        if assigned_set:
+            return [s for s in subjects if s in assigned_set]
+    except Exception:
+        pass
     allowed = accessible_subjects(email)
     if allowed is None:
         return list(subjects)

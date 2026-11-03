@@ -59,10 +59,13 @@ logger = logging.getLogger(__name__)
 def _startup() -> None:
     if len(JWT_SECRET) < 32 or "replace" in JWT_SECRET.casefold():
         raise RuntimeError("Set QUES_JWT_SECRET to a private random value of at least 32 characters.")
-    if app_settings.APP_ENV != "local":
-        raise RuntimeError("Only APP_ENV=local is enabled for the SQLite-only backend.")
-    if app_settings.DATABASE_BACKEND != "sqlite" or app_settings.STORAGE_BACKEND != "sqlite":
-        raise RuntimeError("Only SQLite database and BLOB storage are enabled.")
+    if getattr(app_settings, "APP_ENV", "").casefold() not in {"local", "render"}:
+        raise RuntimeError("APP_ENV must be 'local' or 'render'.")
+    backend = getattr(app_settings, "DATABASE_BACKEND", "turso").casefold()
+    if backend != "turso":
+        raise RuntimeError("Only Turso database backend is enabled for Render deployment.")
+    if getattr(app_settings, "STORAGE_BACKEND", "sqlite").casefold() != "sqlite":
+        raise RuntimeError("Only SQLite BLOB storage is enabled.")
     if app_settings.RECONCILE_INTERVAL_HOURS not in {12, 24}:
         raise RuntimeError("QUES_RECONCILE_INTERVAL_HOURS must be 12 or 24.")
     database.initialize()
@@ -1412,7 +1415,19 @@ def current_user(email: Annotated[str, Depends(require_user)]) -> dict:
         row["access_mode"] = database.get_admin_access_mode(email)
         row["subjects"] = list_subject_names()
     else:
-        row["subjects"] = database.get_teacher_subjects(email)
+        # Include both teacher assignments and user-subject assignments
+        subjects = []
+        try:
+            subjects = [s["subject_name"] for s in database.get_user_subjects_by_email(email)]
+        except Exception:
+            subjects = []
+        if not subjects:
+            subjects = database.get_teacher_subjects(email)
+        row["subjects"] = subjects
+        try:
+            row["subject_permissions"] = database.get_user_subjects_by_email(email)
+        except Exception:
+            row["subject_permissions"] = []
     return row
 
 
@@ -1576,8 +1591,9 @@ def _teacher(row: dict) -> dict:
 
 
 @app.get("/teachers", tags=["teachers"])
-def list_teachers(_: Admin, status: str | None = None, search: str | None = None,
-                  page: int = Query(1, ge=1), page_size: int = Query(50, ge=1, le=200)) -> dict:
+@app.get("/users", tags=["users"])
+def list_teachers_or_users(_: Admin, status: str | None = None, search: str | None = None,
+                          page: int = Query(1, ge=1), page_size: int = Query(50, ge=1, le=200)) -> dict:
     clauses, args = ["role='teacher'"], []
     if status:
         clauses.append("status=?"); args.append(status)
@@ -1704,6 +1720,50 @@ def remove_teacher_subject(teacher_id: int, subject: str, _: AdminWrite):
     validate_subject_name(subject)
     if not database.remove_teacher_subject(teacher_id, subject):
         raise HTTPException(status_code=404, detail="Subject assignment not found")
+
+
+class UserSubjectAssign(BaseModel):
+    subjects: list[str] = Field(default_factory=list)
+    permissions: dict | None = None
+
+
+@app.get("/users/{user_id}/subjects", tags=["users"])
+def get_user_subject_assignments(user_id: int, _: Admin):
+    user = database.get_user_by_id(user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    return {"user_id": user_id, "subjects": database.get_user_subjects(user_id)}
+
+
+@app.post("/users/{user_id}/subjects", tags=["users"])
+def assign_user_subjects_api(user_id: int, request: UserSubjectAssign, _: AdminWrite):
+    user = database.get_user_by_id(user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    subjects = _validated_subjects(request.subjects) if request.subjects else []
+    return database.assign_user_subjects(user_id, subjects, request.permissions or {})
+
+
+@app.put("/users/{user_id}/subjects/{subject}/permissions", tags=["users"])
+def update_user_subject_permissions_api(user_id: int, subject: str, permissions: dict, _: AdminWrite):
+    user = database.get_user_by_id(user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    validate_subject_name(subject)
+    ok = database.update_user_subject_permissions(user_id, subject, permissions)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Assignment not found")
+    return {"user_id": user_id, "subject": subject, "permissions": permissions}
+
+
+@app.delete("/users/{user_id}/subjects/{subject}", status_code=204, tags=["users"])
+def remove_user_subject_api(user_id: int, subject: str, _: AdminWrite):
+    user = database.get_user_by_id(user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    validate_subject_name(subject)
+    if not database.remove_user_subject(user_id, subject):
+        raise HTTPException(status_code=404, detail="Assignment not found")
 
 
 @app.get("/api/dashboard/metrics", tags=["dashboard"])

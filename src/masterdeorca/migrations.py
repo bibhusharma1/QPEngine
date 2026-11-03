@@ -283,6 +283,36 @@ def _migrate_sqlite_blob_storage(db: sqlite3.Connection) -> None:
     )""")
 
 
+def _migrate_user_subject_permissions(db: sqlite3.Connection) -> None:
+    """Per-user subject assignments and feature permissions."""
+    db.execute("""CREATE TABLE IF NOT EXISTS user_subject_assignments (
+        assignment_id TEXT PRIMARY KEY,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        subject_name TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE(user_id, subject_name)
+    )""")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_user_subject_assignments_user ON user_subject_assignments(user_id)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_user_subject_assignments_subject ON user_subject_assignments(subject_name)")
+    db.execute("""CREATE TABLE IF NOT EXISTS user_subject_permissions (
+        permission_id TEXT PRIMARY KEY,
+        assignment_id TEXT NOT NULL REFERENCES user_subject_assignments(assignment_id) ON DELETE CASCADE,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        subject_name TEXT NOT NULL,
+        can_view_papers INTEGER NOT NULL DEFAULT 1,
+        can_upload_process INTEGER NOT NULL DEFAULT 1,
+        can_manage_question_bank INTEGER NOT NULL DEFAULT 1,
+        can_generate_papers INTEGER NOT NULL DEFAULT 1,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE(assignment_id),
+        UNIQUE(user_id, subject_name)
+    )""")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_user_subject_permissions_user ON user_subject_permissions(user_id)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_user_subject_permissions_subject ON user_subject_permissions(subject_name)")
+
+
 MIGRATIONS: tuple[tuple[str, object], ...] = (
     ("teacher_subjects", _migrate_teacher_subjects),
     ("totp_pending_secret", _migrate_totp_pending_secret),
@@ -295,6 +325,7 @@ MIGRATIONS: tuple[tuple[str, object], ...] = (
     ("basic_configurations_v1", _migrate_basic_configurations),
     ("ui_configurations_v1", _migrate_ui_configurations),
     ("sqlite_blob_storage_v1", _migrate_sqlite_blob_storage),
+    ("user_subject_permissions_v1", _migrate_user_subject_permissions),
 )
 
 

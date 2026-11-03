@@ -1,4 +1,4 @@
-"""SQLite source of truth for application records and binary artifacts."""
+"""Database source of truth for application records and binary artifacts (Turso/libSQL)."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from config import settings
-from config.settings import ADMIN_EMAIL, ADMIN_PASSWORD, DATABASE_PATH
+from config.settings import ADMIN_EMAIL, ADMIN_PASSWORD
 from pwdlib import PasswordHash
 
 from src.masterdeorca import migrations
@@ -20,11 +20,59 @@ _password_hash = PasswordHash.recommended()
 _SUBJECT_ID_NAMESPACE = uuid.UUID("bf54f1f5-1d81-4c12-8d70-29b7a414a0e2")
 
 
+def _get_connection():
+    backend = getattr(settings, "DATABASE_BACKEND", "turso").casefold()
+    if backend == "turso":
+        url = getattr(settings, "TURSO_DATABASE_URL", "") or ""
+        token = getattr(settings, "TURSO_AUTH_TOKEN", "") or ""
+        if not url:
+            raise RuntimeError("TURSO_DATABASE_URL must be set for Turso backend")
+        try:
+            import libsql_experimental as libsql  # type: ignore
+        except Exception:
+            try:
+                import libsql_client as libsql  # type: ignore
+            except Exception:
+                try:
+                    import libsql  # type: ignore
+                except Exception as e:
+                    raise RuntimeError(f"libSQL client not available: {e}")
+        if token:
+            try:
+                return libsql.connect(url, auth_token=token)
+            except TypeError:
+                return libsql.connect(url, authToken=token)
+        return libsql.connect(url)
+    # Fallback to local SQLite if explicitly needed (not for Render)
+    db_path = getattr(settings, "DATABASE_PATH", "/data/masterdeorca.sqlite")
+    Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+    db = sqlite3.connect(db_path, timeout=30, isolation_level="DEFERRED")
+    db.row_factory = sqlite3.Row
+    db.execute("PRAGMA foreign_keys=ON")
+    db.execute("PRAGMA busy_timeout=30000")
+    db.execute("PRAGMA synchronous=NORMAL")
+    db.execute("PRAGMA temp_store=MEMORY")
+    return db
+
+
 def connect():
-    if settings.DATABASE_BACKEND != "sqlite":
-        raise RuntimeError("Only the local SQLite storage backend is enabled.")
-    Path(DATABASE_PATH).parent.mkdir(parents=True, exist_ok=True)
-    db = sqlite3.connect(DATABASE_PATH, timeout=30, isolation_level="DEFERRED")
+    backend = getattr(settings, "DATABASE_BACKEND", "turso").casefold()
+    if backend == "turso":
+        db = _get_connection()
+        # Ensure foreign keys if supported
+        try:
+            db.execute("PRAGMA foreign_keys=ON")
+        except Exception:
+            pass
+        try:
+            db.row_factory = sqlite3.Row  # best effort
+        except Exception:
+            pass
+        return db
+    # sqlite fallback
+    db_path = getattr(settings, "DATABASE_PATH", "/data/masterdeorca.sqlite")
+    Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+    db = sqlite3.connect(db_path, timeout=30, isolation_level="DEFERRED")
     db.row_factory = sqlite3.Row
     db.execute("PRAGMA foreign_keys=ON")
     db.execute("PRAGMA busy_timeout=30000")
@@ -34,11 +82,32 @@ def connect():
 
 
 def initialize() -> None:
-    Path(DATABASE_PATH).parent.mkdir(parents=True, exist_ok=True)
-    with sqlite3.connect(DATABASE_PATH, timeout=30) as pragma_db:
+    backend = getattr(settings, "DATABASE_BACKEND", "turso").casefold()
+    if backend == "turso":
+        # Initialize Turso schema
+        db = _get_connection()
+        try:
+            try:
+                db.execute("PRAGMA foreign_keys=ON")
+            except Exception:
+                pass
+            _init_schema(db)
+        finally:
+            try:
+                db.close()
+            except Exception:
+                pass
+        return
+    db_path = getattr(settings, "DATABASE_PATH", "/data/masterdeorca.sqlite")
+    Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(db_path, timeout=30) as pragma_db:
         pragma_db.execute("PRAGMA journal_mode=WAL")
         pragma_db.execute("PRAGMA synchronous=NORMAL")
     with connect() as db:
+        _init_schema(db)
+
+
+def _init_schema(db) -> None:
         db.execute("""CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT, email TEXT NOT NULL UNIQUE,
             name TEXT NOT NULL, hashed_password TEXT NOT NULL, role TEXT NOT NULL,
@@ -386,3 +455,170 @@ def rename_teacher_subject(old_name: str, new_name: str) -> None:
 def delete_teacher_subjects(subject_name: str) -> None:
     with connect() as db:
         db.execute("DELETE FROM teacher_subjects WHERE subject_name=?", (subject_name,))
+        try:
+            db.execute("DELETE FROM user_subject_assignments WHERE subject_name=?", (subject_name,))
+            db.execute("DELETE FROM user_subject_permissions WHERE subject_name=?", (subject_name,))
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# User subject assignments & permissions
+# ---------------------------------------------------------------------------
+
+
+def _ensure_user_assignment_tables(db):
+    try:
+        db.execute("""CREATE TABLE IF NOT EXISTS user_subject_assignments (
+            assignment_id TEXT PRIMARY KEY,
+            user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            subject_name TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(user_id, subject_name)
+        )""")
+        db.execute("""CREATE TABLE IF NOT EXISTS user_subject_permissions (
+            permission_id TEXT PRIMARY KEY,
+            assignment_id TEXT NOT NULL REFERENCES user_subject_assignments(assignment_id) ON DELETE CASCADE,
+            user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            subject_name TEXT NOT NULL,
+            can_view_papers INTEGER NOT NULL DEFAULT 1,
+            can_upload_process INTEGER NOT NULL DEFAULT 1,
+            can_manage_question_bank INTEGER NOT NULL DEFAULT 1,
+            can_generate_papers INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(assignment_id),
+            UNIQUE(user_id, subject_name)
+        )""")
+    except Exception:
+        pass
+
+
+def get_user_by_id(user_id: int):
+    with connect() as db:
+        row = db.execute("SELECT id,email,name,role,status FROM users WHERE id=?", (user_id,)).fetchone()
+        return dict(row) if row else None
+
+
+def get_user_by_email(email: str):
+    with connect() as db:
+        row = db.execute("SELECT id,email,name,role,status FROM users WHERE email=?", (email.lower(),)).fetchone()
+        return dict(row) if row else None
+
+
+def list_all_users():
+    with connect() as db:
+        rows = db.execute("SELECT id,email,name,role,status,department,created_at FROM users ORDER BY id").fetchall()
+        return [dict(r) for r in rows]
+
+
+def assign_user_subjects(user_id: int, subject_names: list[str], permissions: dict | None = None) -> dict:
+    now = datetime.now(timezone.utc).isoformat()
+    permissions = permissions or {}
+    result = {"user_id": user_id, "assigned": []}
+    with connect() as db:
+        _ensure_user_assignment_tables(db)
+        for subject_name in subject_names:
+            subject_name = str(subject_name).strip()
+            if not subject_name:
+                continue
+            assignment_id = uuid.uuid4().hex
+            try:
+                db.execute("""INSERT INTO user_subject_assignments(assignment_id,user_id,subject_name,created_at,updated_at)
+                    VALUES(?,?,?,?,?) ON CONFLICT(user_id,subject_name) DO UPDATE SET updated_at=excluded.updated_at""",
+                    (assignment_id, user_id, subject_name, now, now))
+            except Exception:
+                cur = db.execute("SELECT assignment_id FROM user_subject_assignments WHERE user_id=? AND subject_name=?", (user_id, subject_name))
+                row = cur.fetchone()
+                assignment_id = row["assignment_id"] if row else assignment_id
+            perm_id = uuid.uuid4().hex
+            can_view = 1 if permissions.get("can_view_papers", True) else 0
+            can_upload = 1 if permissions.get("can_upload_process", True) else 0
+            can_manage = 1 if permissions.get("can_manage_question_bank", True) else 0
+            can_generate = 1 if permissions.get("can_generate_papers", True) else 0
+            try:
+                db.execute("""INSERT INTO user_subject_permissions(permission_id,assignment_id,user_id,subject_name,
+                    can_view_papers,can_upload_process,can_manage_question_bank,can_generate_papers,created_at,updated_at)
+                    VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(user_id,subject_name) DO UPDATE SET
+                    can_view_papers=excluded.can_view_papers,can_upload_process=excluded.can_upload_process,
+                    can_manage_question_bank=excluded.can_manage_question_bank,can_generate_papers=excluded.can_generate_papers,
+                    updated_at=excluded.updated_at""",
+                    (perm_id, assignment_id, user_id, subject_name, can_view, can_upload, can_manage, can_generate, now, now))
+            except Exception:
+                pass
+            result["assigned"].append(subject_name)
+    return result
+
+
+def update_user_subject_permissions(user_id: int, subject_name: str, permissions: dict) -> bool:
+    now = datetime.now(timezone.utc).isoformat()
+    with connect() as db:
+        _ensure_user_assignment_tables(db)
+        sets = []
+        vals = []
+        for k, col in [("can_view_papers","can_view_papers"),("can_upload_process","can_upload_process"),
+                       ("can_manage_question_bank","can_manage_question_bank"),("can_generate_papers","can_generate_papers")]:
+            if k in permissions:
+                sets.append(f"{col}=?")
+                vals.append(1 if permissions[k] else 0)
+        if not sets:
+            return False
+        sets.append("updated_at=?")
+        vals.extend([now, user_id, subject_name])
+        cur = db.execute(f"UPDATE user_subject_permissions SET {', '.join(sets)} WHERE user_id=? AND subject_name=?", vals)
+        return cur.rowcount > 0
+
+
+def remove_user_subject(user_id: int, subject_name: str) -> bool:
+    with connect() as db:
+        try:
+            _ensure_user_assignment_tables(db)
+            cur = db.execute("DELETE FROM user_subject_assignments WHERE user_id=? AND subject_name=?", (user_id, subject_name))
+            db.execute("DELETE FROM user_subject_permissions WHERE user_id=? AND subject_name=?", (user_id, subject_name))
+            return cur.rowcount > 0
+        except Exception:
+            return False
+
+
+def get_user_subjects(user_id: int):
+    with connect() as db:
+        try:
+            _ensure_user_assignment_tables(db)
+            rows = db.execute("""SELECT a.subject_name, p.can_view_papers,p.can_upload_process,p.can_manage_question_bank,p.can_generate_papers
+                FROM user_subject_assignments a LEFT JOIN user_subject_permissions p ON p.assignment_id=a.assignment_id
+                WHERE a.user_id=? ORDER BY a.subject_name""", (user_id,)).fetchall()
+            return [dict(r) for r in rows]
+        except Exception:
+            return []
+
+
+def get_user_subjects_by_email(email: str):
+    user = get_user_by_email(email)
+    if not user:
+        return []
+    return get_user_subjects(user["id"])
+
+
+def check_user_subject_permission(email: str, subject_name: str, permission: str) -> bool:
+    user = get_user_by_email(email)
+    if not user:
+        return False
+    if user.get("role") == "admin":
+        return True
+    with connect() as db:
+        try:
+            _ensure_user_assignment_tables(db)
+            row = db.execute("""SELECT p.can_view_papers,p.can_upload_process,p.can_manage_question_bank,p.can_generate_papers
+                FROM user_subject_permissions p WHERE p.user_id=? AND p.subject_name=?""", (user["id"], subject_name)).fetchone()
+            if not row:
+                return False
+            mapping = {
+                "view_papers": row["can_view_papers"],
+                "upload_process": row["can_upload_process"],
+                "manage_question_bank": row["can_manage_question_bank"],
+                "generate_papers": row["can_generate_papers"],
+            }
+            return bool(mapping.get(permission, 0))
+        except Exception:
+            return False

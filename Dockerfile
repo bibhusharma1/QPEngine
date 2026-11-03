@@ -1,22 +1,20 @@
+# NVIDIA Lite mode Dockerfile (default for Render/local Docker)
 FROM ghcr.io/astral-sh/uv:python3.11-bookworm-slim
 
 WORKDIR /app
 ENV UV_PROJECT_ENVIRONMENT=/app/.venv \
     PYTHONUNBUFFERED=1 \
-    PYTHONDONTWRITEBYTECODE=1
+    PYTHONDONTWRITEBYTECODE=1 \
+    PARSER_MODE=llm
 
 COPY pyproject.toml uv.lock README.md ./
-ARG INSTALL_OCR_GPU=false
-RUN if [ "$INSTALL_OCR_GPU" = "true" ]; then \
-      uv sync --frozen --no-dev --extra ocr-gpu; \
-    else \
-      uv sync --frozen --no-dev; \
-    fi
+RUN uv sync --frozen --no-dev
 
 COPY config ./config
 COPY functions ./functions
 COPY src ./src
 COPY pipeline_runner.py ./pipeline_runner.py
+COPY scripts ./scripts
 
 EXPOSE 8000
-CMD ["/app/.venv/bin/uvicorn", "src.masterdeorca.app:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["sh", "-c", "uvicorn src.masterdeorca.app:app --host 0.0.0.0 --port ${PORT:-8000}"]

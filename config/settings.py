@@ -22,19 +22,19 @@ def resolve_path(value: str | Path, *, base: Path | None = None) -> Path:
     return ((base or PROJECT_ROOT) / path).resolve()
 
 
-STORAGE_ROOT = resolve_path(
-    setting("QUES_STORAGE_ROOT", str(Path.home() / ".local" / "share" / "masterdeorca"))
-)
+# Render-only deployment configuration
+STORAGE_ROOT = resolve_path(setting("QUES_STORAGE_ROOT", "/data"))
 DEFAULT_SUBJECT = setting("QUES_DEFAULT_SUBJECT", "OperatingSys")
 MAX_UPLOAD_BYTES = int(setting("QUES_MAX_UPLOAD_MB", "50")) * 1024 * 1024
 API_PORT = int(setting("QUES_PORT", "8000"))
-DATABASE_BACKEND = setting("DATABASE_BACKEND", "sqlite").casefold()
-DATABASE_PATH = resolve_path(
-    setting("DATABASE_PATH", setting("QUES_DATABASE_PATH", str(STORAGE_ROOT / "masterdeorca.sqlite")))
-)
+DATABASE_BACKEND = setting("DATABASE_BACKEND", "turso").casefold()
+# For Turso, we use connection URL/token; DATABASE_PATH not used
+DATABASE_PATH = resolve_path(setting("DATABASE_PATH", "/data/masterdeorca.sqlite"))
 _storage_backend = setting("STORAGE_BACKEND", "sqlite").casefold()
 STORAGE_BACKEND = "sqlite" if _storage_backend == "local" else _storage_backend
-APP_ENV = setting("APP_ENV", "local").casefold()
+APP_ENV = setting("APP_ENV", "render").casefold()
+TURSO_DATABASE_URL = setting("TURSO_DATABASE_URL", "")
+TURSO_AUTH_TOKEN = setting("TURSO_AUTH_TOKEN", "")
 RECONCILE_ENABLED = setting("QUES_RECONCILE_ENABLED", "true").casefold() in {
     "1", "true", "yes", "on"
 }
@@ -57,6 +57,7 @@ RECONSTRUCT_ROOT = resolve_path(setting("QUES_RECON_OUTPUT_DIR", str(STORAGE_ROO
 
 
 # Document intelligence / scraper-parser configuration
+# Default to NVIDIA Lite mode for Render; can be overridden for local dev
 PARSER_MODE = setting("PARSER_MODE", "llm").lower()
 NVIDIA_PARSE_MODEL = setting("NVIDIA_PARSE_MODEL", "nvidia/nemotron-3.5-parse")
 NVIDIA_STRUCTURE_MODEL = setting(
