@@ -57,13 +57,20 @@ logger = logging.getLogger(__name__)
 
 
 def _startup() -> None:
+    import os
+    # Ensure env vars are picked up
+    backend_env = os.environ.get("DATABASE_BACKEND") or getattr(app_settings, "DATABASE_BACKEND", "turso")
+    backend = str(backend_env).casefold()
+    if backend != "turso":
+        raise RuntimeError("Only Turso database backend is enabled for Render deployment. Set DATABASE_BACKEND=turso and TURSO_DATABASE_URL/TURSO_AUTH_TOKEN.")
+    if not (os.environ.get("TURSO_DATABASE_URL") or getattr(app_settings, "TURSO_DATABASE_URL", "")):
+        raise RuntimeError("TURSO_DATABASE_URL is not set. Set it in Render environment variables.")
+    if not (os.environ.get("TURSO_AUTH_TOKEN") or getattr(app_settings, "TURSO_AUTH_TOKEN", "")):
+        raise RuntimeError("TURSO_AUTH_TOKEN is not set. Set it in Render environment variables.")
     if len(JWT_SECRET) < 32 or "replace" in JWT_SECRET.casefold():
         raise RuntimeError("Set QUES_JWT_SECRET to a private random value of at least 32 characters.")
     if getattr(app_settings, "APP_ENV", "").casefold() not in {"local", "render"}:
         raise RuntimeError("APP_ENV must be 'local' or 'render'.")
-    backend = getattr(app_settings, "DATABASE_BACKEND", "turso").casefold()
-    if backend != "turso":
-        raise RuntimeError("Only Turso database backend is enabled for Render deployment.")
     if getattr(app_settings, "STORAGE_BACKEND", "sqlite").casefold() != "sqlite":
         raise RuntimeError("Only SQLite BLOB storage is enabled.")
     if app_settings.RECONCILE_INTERVAL_HOURS not in {12, 24}:
