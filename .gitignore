@@ -1,0 +1,27 @@
+# Python caches and build products
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+build/
+dist/
+wheels/
+*.egg-info/
+
+# Local environments and credentials
+.venv/
+**/.venv/
+.env
+*.sqlite
+*.sqlite3
+*.db
+/output/
+
+# Temporary output files
+*.json.tmp
+*.json.bak
+.DS_Store
+
+metadata
+

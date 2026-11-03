@@ -1,0 +1,388 @@
+"""SQLite source of truth for application records and binary artifacts."""
+
+from __future__ import annotations
+
+import json
+import hashlib
+import sqlite3
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+from config import settings
+from config.settings import ADMIN_EMAIL, ADMIN_PASSWORD, DATABASE_PATH
+from pwdlib import PasswordHash
+
+from src.masterdeorca import migrations
+
+_password_hash = PasswordHash.recommended()
+_SUBJECT_ID_NAMESPACE = uuid.UUID("bf54f1f5-1d81-4c12-8d70-29b7a414a0e2")
+
+
+def connect():
+    if settings.DATABASE_BACKEND != "sqlite":
+        raise RuntimeError("Only the local SQLite storage backend is enabled.")
+    Path(DATABASE_PATH).parent.mkdir(parents=True, exist_ok=True)
+    db = sqlite3.connect(DATABASE_PATH, timeout=30, isolation_level="DEFERRED")
+    db.row_factory = sqlite3.Row
+    db.execute("PRAGMA foreign_keys=ON")
+    db.execute("PRAGMA busy_timeout=30000")
+    db.execute("PRAGMA synchronous=NORMAL")
+    db.execute("PRAGMA temp_store=MEMORY")
+    return db
+
+
+def initialize() -> None:
+    Path(DATABASE_PATH).parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(DATABASE_PATH, timeout=30) as pragma_db:
+        pragma_db.execute("PRAGMA journal_mode=WAL")
+        pragma_db.execute("PRAGMA synchronous=NORMAL")
+    with connect() as db:
+        db.execute("""CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, email TEXT NOT NULL UNIQUE,
+            name TEXT NOT NULL, hashed_password TEXT NOT NULL, role TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'active', department TEXT, created_at TEXT NOT NULL,
+            totp_secret_encrypted TEXT,
+            totp_enabled INTEGER NOT NULL DEFAULT 0,
+            totp_enrolled INTEGER NOT NULL DEFAULT 0,
+            totp_failed_attempts INTEGER NOT NULL DEFAULT 0,
+            totp_cooldown_until TEXT,
+            totp_last_used_step TEXT
+        )""")
+        # Add columns if they don't exist (for migration)
+        try:
+            db.execute("ALTER TABLE users ADD COLUMN totp_secret_encrypted TEXT")
+        except Exception:
+            pass
+        try:
+            db.execute("ALTER TABLE users ADD COLUMN totp_enabled INTEGER NOT NULL DEFAULT 0")
+        except Exception:
+            pass
+        try:
+            db.execute("ALTER TABLE users ADD COLUMN totp_enrolled INTEGER NOT NULL DEFAULT 0")
+        except Exception:
+            pass
+        try:
+            db.execute("ALTER TABLE users ADD COLUMN totp_failed_attempts INTEGER NOT NULL DEFAULT 0")
+        except Exception:
+            pass
+        try:
+            db.execute("ALTER TABLE users ADD COLUMN totp_cooldown_until TEXT")
+        except Exception:
+            pass
+        try:
+            db.execute("ALTER TABLE users ADD COLUMN totp_last_used_step TEXT")
+        except Exception:
+            pass
+        db.execute("""CREATE TABLE IF NOT EXISTS totp_login_challenges (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            challenge_token TEXT NOT NULL UNIQUE,
+            user_email TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            used INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL
+        )""")
+        db.execute("""CREATE TABLE IF NOT EXISTS totp_rate_limits (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            key TEXT NOT NULL,
+            attempts INTEGER NOT NULL DEFAULT 0,
+            window_start TEXT NOT NULL,
+            cooldown_until TEXT
+        )""")
+        db.execute("""CREATE TABLE IF NOT EXISTS topics (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, subject_name TEXT NOT NULL,
+            name TEXT NOT NULL, unit INTEGER, description TEXT,
+            UNIQUE(subject_name, name)
+        )""")
+        db.execute("""CREATE TABLE IF NOT EXISTS questions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, subject_name TEXT NOT NULL,
+            topic_id INTEGER REFERENCES topics(id) ON DELETE SET NULL,
+            text TEXT NOT NULL, difficulty TEXT NOT NULL, type TEXT NOT NULL,
+            marks INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'pending',
+            source TEXT NOT NULL DEFAULT 'manual', created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL, UNIQUE(source, text)
+        )""")
+        db.execute("""CREATE TABLE IF NOT EXISTS papers (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL,
+            subject_name TEXT NOT NULL, exam_type TEXT NOT NULL DEFAULT '',
+            total_marks INTEGER NOT NULL DEFAULT 0, duration TEXT NOT NULL DEFAULT '',
+            question_count INTEGER NOT NULL DEFAULT 0, created_by INTEGER REFERENCES users(id),
+            status TEXT NOT NULL DEFAULT 'draft', created_at TEXT NOT NULL,
+            content_json TEXT NOT NULL DEFAULT '{}'
+        )""")
+        try:
+            db.execute("ALTER TABLE papers ADD COLUMN created_by INTEGER REFERENCES users(id)")
+        except Exception:
+            pass
+        db.execute("""CREATE TABLE IF NOT EXISTS pdf_reviews (
+            subject TEXT NOT NULL, filename TEXT NOT NULL, review_status TEXT NOT NULL DEFAULT 'unreviewed',
+            PRIMARY KEY(subject, filename)
+        )""")
+        db.execute("CREATE TABLE IF NOT EXISTS admins (email TEXT PRIMARY KEY, password_hash TEXT NOT NULL)")
+        try:
+            db.execute("ALTER TABLE admins ADD COLUMN access_mode TEXT NOT NULL DEFAULT 'edit'")
+        except Exception:
+            pass
+        db.execute("""CREATE TABLE IF NOT EXISTS jobs (
+            job_id TEXT PRIMARY KEY, subject TEXT NOT NULL, filename TEXT NOT NULL,
+            status TEXT NOT NULL, stage TEXT NOT NULL, started_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL, error TEXT, result_json TEXT
+        )""")
+        db.execute("""CREATE TABLE IF NOT EXISTS reconciliation_state (
+            subject TEXT NOT NULL, filename TEXT NOT NULL, stage TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending', retry_count INTEGER NOT NULL DEFAULT 0,
+            last_error TEXT, last_attempt_at TEXT, next_retry_at TEXT,
+            updated_at TEXT NOT NULL, PRIMARY KEY(subject, filename, stage)
+        )""")
+        migrations.run_migrations(db)
+        existing = db.execute("SELECT email FROM admins WHERE email = ?", (ADMIN_EMAIL,)).fetchone()
+        if existing:
+            db.execute("UPDATE admins SET password_hash = ? WHERE email = ?", (_password_hash.hash(ADMIN_PASSWORD), ADMIN_EMAIL))
+        else:
+            db.execute("INSERT INTO admins(email, password_hash) VALUES (?, ?)", (ADMIN_EMAIL, _password_hash.hash(ADMIN_PASSWORD)))
+        admin = db.execute("SELECT id FROM users WHERE email=?", (ADMIN_EMAIL,)).fetchone()
+        if admin:
+            db.execute("UPDATE users SET name='Administrator', role='admin', status='active', hashed_password=(SELECT password_hash FROM admins WHERE email=?) WHERE email=?", (ADMIN_EMAIL, ADMIN_EMAIL))
+        else:
+            db.execute("INSERT INTO users(email,name,hashed_password,role,status,created_at) VALUES (?,?,?,?,?,?)",
+                       (ADMIN_EMAIL, "Administrator", _password_hash.hash(ADMIN_PASSWORD), "admin", "active", datetime.now(timezone.utc).isoformat()))
+
+
+def ensure_subject_record(db: Any, subject_name: str) -> str:
+    """Return a stable database subject ID, creating a record for an explicit subject."""
+    now = datetime.now(timezone.utc).isoformat()
+    subject_id = str(uuid.uuid5(_SUBJECT_ID_NAMESPACE, f"subject/{subject_name}"))
+    db.execute(
+        "INSERT OR IGNORE INTO subjects(subject_id,subject_name,created_at,updated_at) "
+        "VALUES(?,?,?,?)",
+        (subject_id, subject_name, now, now),
+    )
+    row = db.execute(
+        "SELECT subject_id FROM subjects WHERE subject_name=?",
+        (subject_name,),
+    ).fetchone()
+    if row is None:
+        raise RuntimeError(f"Unable to register subject {subject_name!r}.")
+    return str(row["subject_id"])
+
+
+def get_subject_id(subject_name: str) -> str | None:
+    with connect() as db:
+        row = db.execute(
+            "SELECT subject_id FROM subjects WHERE subject_name=?",
+            (subject_name,),
+        ).fetchone()
+    return str(row["subject_id"]) if row else None
+
+
+def get_document(subject_name: str, filename: str) -> dict[str, Any] | None:
+    with connect() as db:
+        row = db.execute(
+            """SELECT d.* FROM documents d JOIN subjects s ON s.subject_id=d.subject_id
+               WHERE s.subject_name=? AND d.filename=?""",
+            (subject_name, filename),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def get_document_bytes(subject_name: str, filename: str) -> bytes | None:
+    with connect() as db:
+        row = db.execute(
+            """SELECT content_blob FROM documents d JOIN subjects s ON s.subject_id=d.subject_id
+               WHERE s.subject_name=? AND d.filename=?""",
+            (subject_name, filename),
+        ).fetchone()
+    return bytes(row["content_blob"]) if row and row["content_blob"] is not None else None
+
+
+def put_artifact(
+    *,
+    subject_id: str | None,
+    document_id: str | None,
+    artifact_key: str,
+    artifact_type: str,
+    content_type: str,
+    data: bytes,
+    metadata: dict[str, Any] | None = None,
+) -> None:
+    now = datetime.now(timezone.utc).isoformat()
+    digest = hashlib.sha256(data).hexdigest()
+    with connect() as db:
+        existing = db.execute(
+            "SELECT checksum_sha256 FROM stored_artifacts WHERE document_id IS ? AND artifact_key=?",
+            (document_id, artifact_key),
+        ).fetchone()
+        if existing and existing["checksum_sha256"] == digest:
+            return
+        db.execute(
+            """INSERT INTO stored_artifacts(
+                artifact_id,subject_id,document_id,artifact_key,artifact_type,content_type,
+                checksum_sha256,size_bytes,data,metadata_json,created_at,updated_at
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(document_id,artifact_key) DO UPDATE SET
+                subject_id=excluded.subject_id,artifact_type=excluded.artifact_type,
+                content_type=excluded.content_type,checksum_sha256=excluded.checksum_sha256,
+                size_bytes=excluded.size_bytes,data=excluded.data,
+                metadata_json=excluded.metadata_json,updated_at=excluded.updated_at""",
+            (
+                uuid.uuid4().hex,
+                subject_id,
+                document_id,
+                artifact_key,
+                artifact_type,
+                content_type,
+                digest,
+                len(data),
+                data,
+                json.dumps(metadata or {}, ensure_ascii=False),
+                now,
+                now,
+            ),
+        )
+
+
+def get_artifact(document_id: str, artifact_key: str) -> dict[str, Any] | None:
+    with connect() as db:
+        row = db.execute(
+            """SELECT artifact_type,content_type,checksum_sha256,size_bytes,data,metadata_json
+               FROM stored_artifacts WHERE document_id=? AND artifact_key=?""",
+            (document_id, artifact_key),
+        ).fetchone()
+    if not row:
+        return None
+    result = dict(row)
+    result["data"] = bytes(result["data"])
+    result["metadata"] = json.loads(result.pop("metadata_json"))
+    return result
+
+
+def get_admin_access_mode(email: str) -> str:
+    """Return the administrator's access mode ('edit' by default, always server-side)."""
+    with connect() as db:
+        try:
+            row = db.execute("SELECT access_mode FROM admins WHERE email=?", (email.lower(),)).fetchone()
+        except sqlite3.Error:
+            return "edit"
+    return row["access_mode"] if row and row["access_mode"] in {"readonly", "edit"} else "edit"
+
+
+def set_admin_access_mode(email: str, mode: str) -> bool:
+    """Persist the access mode for an administrator account; returns False when absent."""
+    with connect() as db:
+        cur = db.execute("UPDATE admins SET access_mode=? WHERE email=?", (mode, email.lower()))
+    return cur.rowcount > 0
+
+
+def mark_interrupted_jobs() -> None:
+    """Make unfinished in-process jobs retryable after an API restart."""
+    now = datetime.now(timezone.utc).isoformat()
+    with connect() as db:
+        db.execute("""UPDATE jobs SET status='failed', stage='interrupted', updated_at=?,
+            error='Worker stopped before completion. Start a fresh processing run.'
+            WHERE status IN ('queued', 'running')""", (now,))
+
+
+def verify_admin(email: str, password: str) -> bool:
+    with connect() as db:
+        row = db.execute("SELECT password_hash FROM admins WHERE email = ?", (email.lower(),)).fetchone()
+    if not row:
+        # Reduce user enumeration timing differences.
+        _password_hash.verify(password, _password_hash.hash("invalid-login-padding"))
+        return False
+
+
+def verify_user(email: str, password: str) -> bool:
+    with connect() as db:
+        row = db.execute("SELECT hashed_password,status FROM users WHERE email=?", (email.lower(),)).fetchone()
+    if not row or row["status"] not in {"active", "approved"}:
+        _password_hash.verify(password, _password_hash.hash("invalid-login-padding"))
+        return False
+    try:
+        return _password_hash.verify(password, row["hashed_password"])
+    except (ValueError, TypeError):
+        return False
+
+
+def save_job(job: dict[str, Any]) -> None:
+    now = datetime.now(timezone.utc).isoformat()
+    with connect() as db:
+        db.execute("""INSERT INTO jobs(job_id, subject, filename, status, stage, started_at, updated_at, error, result_json)
+            VALUES (:job_id, :subject, :filename, :status, :stage, :started_at, :updated_at, :error, :result_json)
+            ON CONFLICT(job_id) DO UPDATE SET status=excluded.status, stage=excluded.stage,
+            updated_at=excluded.updated_at, error=excluded.error, result_json=excluded.result_json""", {
+                **job, "updated_at": now,
+                "result_json": json.dumps(job.get("result")) if job.get("result") is not None else None,
+            })
+
+
+def get_job(job_id: str) -> dict[str, Any] | None:
+    with connect() as db:
+        row = db.execute("SELECT * FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
+    if not row:
+        return None
+    result = dict(row)
+    result["result"] = json.loads(result.pop("result_json")) if result.get("result_json") else None
+    return result
+
+
+def latest_job(subject: str, filename: str) -> dict[str, Any] | None:
+    with connect() as db:
+        row = db.execute("SELECT job_id FROM jobs WHERE subject=? AND filename=? ORDER BY started_at DESC LIMIT 1", (subject, filename)).fetchone()
+    return get_job(row["job_id"]) if row else None
+
+
+# ---------------------------------------------------------------------------
+# Teacher -> subject assignments (RBAC)
+# ---------------------------------------------------------------------------
+
+
+def get_teacher_by_id(teacher_id: int) -> dict | None:
+    with connect() as db:
+        row = db.execute("SELECT id,email,name,role FROM users WHERE id=? AND role='teacher'", (teacher_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def get_teacher_subjects(email: str) -> list[str]:
+    """Subject names assigned to a teacher account, ordered (empty when none)."""
+    with connect() as db:
+        rows = db.execute(
+            """SELECT ts.subject_name FROM teacher_subjects ts
+               JOIN users u ON u.id = ts.teacher_id WHERE u.email=? ORDER BY ts.subject_name""",
+            (email.lower(),)).fetchall()
+    return [row["subject_name"] for row in rows]
+
+
+def set_teacher_subjects(teacher_id: int, subject_names: list[str]) -> None:
+    """Replace a teacher's full assignment set in one transaction."""
+    now = datetime.now(timezone.utc).isoformat()
+    with connect() as db:
+        db.execute("DELETE FROM teacher_subjects WHERE teacher_id=?", (teacher_id,))
+        db.executemany("INSERT INTO teacher_subjects(teacher_id, subject_name, created_at) VALUES(?,?,?)",
+                       [(teacher_id, name, now) for name in subject_names])
+
+
+def add_teacher_subject(teacher_id: int, subject_name: str) -> bool:
+    now = datetime.now(timezone.utc).isoformat()
+    with connect() as db:
+        cur = db.execute(
+            "INSERT OR IGNORE INTO teacher_subjects(teacher_id, subject_name, created_at) VALUES(?,?,?)",
+            (teacher_id, subject_name, now))
+    return cur.rowcount > 0
+
+
+def remove_teacher_subject(teacher_id: int, subject_name: str) -> bool:
+    with connect() as db:
+        cur = db.execute("DELETE FROM teacher_subjects WHERE teacher_id=? AND subject_name=?",
+                           (teacher_id, subject_name))
+    return cur.rowcount > 0
+
+
+def rename_teacher_subject(old_name: str, new_name: str) -> None:
+    with connect() as db:
+        db.execute("UPDATE teacher_subjects SET subject_name=? WHERE subject_name=?", (new_name, old_name))
+
+
+def delete_teacher_subjects(subject_name: str) -> None:
+    with connect() as db:
+        db.execute("DELETE FROM teacher_subjects WHERE subject_name=?", (subject_name,))

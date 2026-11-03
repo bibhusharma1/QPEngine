@@ -1,0 +1,14 @@
+.env
+.venv/
+**/.venv/
+**/.git/
+.git/
+.pytest_cache/
+**/__pycache__/
+*.py[cod]
+output/
+data/
+authUser/
+metadata/
+tests/
+docs/

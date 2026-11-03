@@ -1,0 +1,58 @@
+[project]
+name = "masterdeorca"
+version = "1.0.0"
+description = "FastAPI backend for PDF question extraction, parsing, and DOCX reconstruction"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "python-multipart>=0.0.9",
+    "python-dotenv>=1.0",
+    "pydantic>=2.0,<3",
+    "PyMuPDF>=1.24.0",
+    "Pillow>=10.0",
+    "python-docx>=1.1.0",
+    "langchain>=0.3.0",
+    "langchain-core>=0.3.0,<2",
+    "langchain-google-genai>=2.0.0",
+    "langchain-mistralai>=0.2.0",
+    "langchain-groq>=0.2.0",
+    "langchain-nvidia-ai-endpoints>=0.3.0",
+    "langchain-cerebras>=0.1.0",
+    "langchain-openai>=0.2.0",
+    "langgraph>=0.2.0",
+    "pwdlib[argon2]>=0.2.1",
+    "PyJWT>=2.9.0",
+    "pyotp>=2.9.0",
+    "cryptography>=42.0.0",
+    "qrcode>=8.0",
+]
+
+[dependency-groups]
+dev = ["pytest>=8.0", "httpx>=0.28.1"]
+
+
+[project.optional-dependencies]
+ocr-gpu = [
+    "paddlepaddle-gpu>=3.2.4,<3.4 ; sys_platform == 'linux' and python_version < '3.12'",
+    "paddleocr[doc-parser]>=3.7.0 ; sys_platform == 'linux' and python_version < '3.12'",
+]
+turso = [
+    "turso_serverless",
+    "pyturso",
+]
+
+[build-system]
+requires = ["uv_build>=0.13.6,<0.14.0"]
+build-backend = "uv_build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["hardware: requires a real supported NVIDIA GPU"]
+
+[tool.uv]
+package = false
+
+[tool.uv.sources]
+paddlepaddle-gpu = { url = "https://paddle-whl.cdn.bcebos.com/stable/cu126/paddlepaddle-gpu/paddlepaddle_gpu-3.3.1-cp311-cp311-linux_x86_64.whl", marker = "sys_platform == 'linux' and python_version < '3.12'" }

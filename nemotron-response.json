@@ -1,0 +1,1 @@
+{"object":"error","message":"invalid options JSON","type":"invalid_request_error","detail":"unknown field `config`, expected `decoding` at line 1 column 9"}

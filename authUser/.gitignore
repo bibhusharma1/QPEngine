@@ -1,0 +1,15 @@
+# uv lock file
+uv.lock
+
+# virtual env
+.venv/
+
+# local sqlite db (auto-generated)
+local_auth.db
+
+# env secrets
+.env
+
+# python
+__pycache__/
+*.pyc
