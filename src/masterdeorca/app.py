@@ -99,8 +99,8 @@ _cors = list(app_settings.CORS_ORIGINS)
 _env = os.environ.get("QUES_CORS_ORIGINS", "")
 if _env:
     _cors = [o.strip() for o in _env.split(",") if o.strip()]
-# Ensure local origins are always allowed
-for _o in ["http://localhost", "http://localhost:3000", "http://127.0.0.1", "http://127.0.0.1:3000", "http://localhost:5173", "http://127.0.0.1:5173"]:
+# Ensure local and deployed frontend origins are always allowed
+for _o in ["http://localhost", "http://localhost:3000", "http://127.0.0.1", "http://127.0.0.1:3000", "http://localhost:5173", "http://127.0.0.1:5173", "https://gceqpgen.vercel.app"]:
     if _o not in _cors:
         _cors.append(_o)
 app.add_middleware(CORSMiddleware, allow_origins=_cors, allow_credentials=True, allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"], allow_headers=["Authorization", "Content-Type", "Accept", "Accept-Language", "Content-Language"])
