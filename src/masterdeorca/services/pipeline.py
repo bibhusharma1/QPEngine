@@ -275,5 +275,6 @@ def _run_lite_job(job: dict) -> None:
             if ("API_KEY" in key or "SECRET" in key or "PASSWORD" in key) and value:
                 safe_message = safe_message.replace(value, "[REDACTED]")
         logger.error("Lite PDF job %s failed: %s: %s", job["job_id"], type(exc).__name__, safe_message)
-        _update(job, status="failed", stage=job.get("stage", "failed"), error=f"{type(exc).__name__}: processing failed; inspect the subject log for details.")
+        _update(job, status="failed", stage=job.get("stage", "failed"),
+                error=f"{type(exc).__name__}: {safe_message}"[:500])
         _log(job, f"Lite processing failed: {type(exc).__name__}: {safe_message}")

@@ -1112,7 +1112,7 @@ def list_pdfs(user: Annotated[str, Depends(require_user)], subject: str) -> dict
         raise HTTPException(status_code=404, detail="Subject not found")
     require_subject_access(user, subject)
     subject_id = database.get_subject_id(subject)
-    manifest = processing_manifest.sync_subject(subject, _subject_jobs(subject))
+    manifest = processing_manifest.load_subject(subject)
     manifest_by_name = {item.get("filename"): item for item in manifest["pdfs"]}
     items = []
     if subject_id is None:
@@ -1293,9 +1293,21 @@ def start_processing(subject: str, filename: str, background: BackgroundTasks,
     force = request.force if request is not None else True
     previous = database.latest_job(subject, safe_filename)
     if previous and previous["status"] in {"queued", "running"}:
-        raise HTTPException(status_code=409, detail={"message": "This document is already processing.", "job_id": previous["job_id"]})
+        raise HTTPException(status_code=409, detail={"message": "This document is already processing.", "job_id": previous["job_id"], "status": previous["status"]})
     if previous and previous["status"] in {"succeeded", "completed_with_errors"} and not force:
-        raise HTTPException(status_code=409, detail="Document is already processed; set force=true to run a fresh scrape and parse.")
+        # Reuse completed, valid persisted results instead of processing again.
+        document = database.get_document(subject, safe_filename)
+        parsed_artifact = database.get_artifact(document["document_id"], "questions_parsed.json") if document else None
+        valid_result = False
+        if parsed_artifact is not None:
+            try:
+                bank = json.loads(parsed_artifact["data"].decode("utf-8"))
+                questions = bank.get("questions") if isinstance(bank, dict) else None
+                valid_result = isinstance(questions, list) and len(questions) > 0
+            except (UnicodeDecodeError, json.JSONDecodeError, TypeError, AttributeError):
+                valid_result = False
+        if valid_result:
+            raise HTTPException(status_code=409, detail={"message": "Document is already processed; set force=true to run a fresh scrape and parse.", "job_id": previous["job_id"], "status": previous["status"]})
     key = (subject, safe_filename)
     with _active_lock:
         if key in _active_jobs:

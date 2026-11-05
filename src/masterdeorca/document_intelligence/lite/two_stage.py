@@ -507,6 +507,93 @@ def _resolve_question_candidates(
     block_map: dict[str, dict[str, Any]],
     figure_assets: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
+    # Normalize alternative reference field names produced by valid model
+    # responses so question data is not dropped for formatting differences.
+    normalized_classifications: list[dict[str, Any]] = []
+    for classification in classifications or []:
+        if not isinstance(classification, dict):
+            continue
+        normalized = dict(classification)
+        normalized_questions = []
+        for question in classification.get("questions") or []:
+            if not isinstance(question, dict):
+                continue
+            q = dict(question)
+            q["question_number"] = (
+                q.get("question_number")
+                or q.get("number")
+                or q.get("question")
+                or q.get("label")
+                or q.get("id")
+                or q.get("question_no")
+                or q.get("q_number")
+            )
+            q["block_ids"] = (
+                q.get("block_ids")
+                or q.get("blocks")
+                or q.get("refs")
+                or q.get("references")
+                or q.get("block_references")
+                or []
+            )
+            q["instruction_block_ids"] = (
+                q.get("instruction_block_ids")
+                or q.get("instruction_blocks")
+                or q.get("instruction_refs")
+                or []
+            )
+            q["figure_asset_ids"] = (
+                q.get("figure_asset_ids")
+                or q.get("figure_assets")
+                or q.get("asset_ids")
+                or q.get("assets")
+                or []
+            )
+            q["ambiguous_block_ids"] = (
+                q.get("ambiguous_block_ids")
+                or q.get("ambiguous_blocks")
+                or q.get("ambiguous_refs")
+                or []
+            )
+            if "sub_questions" not in q:
+                q["sub_questions"] = (
+                    q.get("subquestions")
+                    or q.get("sub_parts")
+                    or q.get("parts")
+                    or []
+                )
+            normalized_sub = []
+            for sub in q.get("sub_questions") or []:
+                if not isinstance(sub, dict):
+                    continue
+                s = dict(sub)
+                s["block_ids"] = (
+                    s.get("block_ids")
+                    or s.get("blocks")
+                    or s.get("refs")
+                    or s.get("references")
+                    or []
+                )
+                s["figure_asset_ids"] = (
+                    s.get("figure_asset_ids")
+                    or s.get("figure_assets")
+                    or s.get("asset_ids")
+                    or s.get("assets")
+                    or []
+                )
+                s["ambiguous_block_ids"] = (
+                    s.get("ambiguous_block_ids")
+                    or s.get("ambiguous_blocks")
+                    or s.get("ambiguous_refs")
+                    or []
+                )
+                normalized_sub.append(s)
+            q["sub_questions"] = normalized_sub
+            normalized_questions.append(q)
+        normalized["questions"] = normalized_questions
+        normalized_classifications.append(normalized)
+
+    classifications = normalized_classifications
     merged_questions: dict[str, dict[str, Any]] = {}
     section_refs: list[dict[str, Any]] = []
     orphan_ambiguities: list[str] = []
@@ -514,9 +601,23 @@ def _resolve_question_candidates(
         section_refs.extend(classification.get("sections") or [])
         orphan_ambiguities.extend(classification.get("ambiguous_block_ids") or [])
         for question in classification.get("questions") or []:
-            number = str(question.get("question_number") or "").strip()
+            number = str(
+                question.get("question_number")
+                or question.get("number")
+                or question.get("question")
+                or question.get("label")
+                or question.get("id")
+                or question.get("question_no")
+                or question.get("q_number")
+                or ""
+            ).strip()
             if not number:
-                orphan_ambiguities.extend(question.get("block_ids") or [])
+                orphan_ambiguities.extend(
+                    question.get("block_ids")
+                    or question.get("blocks")
+                    or question.get("refs")
+                    or []
+                )
                 continue
             numbered_subpart = re.fullmatch(
                 r"(?:Q\.?\s*)?(\d+)\s*\(([^)]+)\)",
@@ -765,11 +866,92 @@ def _resolve_question_candidates(
                 *nearest["ambiguity_notes"],
                 note,
             ]))
-    return _apply_explicit_question_boundaries(
+    result = _apply_explicit_question_boundaries(
         candidates,
         sorted(block_map.values(), key=lambda block: block["reading_order"]),
         figure_assets,
     )
+    if not result:
+        fallback = _fallback_candidates_from_blocks(
+            sorted(block_map.values(), key=lambda block: block["reading_order"]),
+            block_map,
+            figure_assets,
+        )
+        if fallback:
+            result = _apply_explicit_question_boundaries(
+                fallback,
+                sorted(block_map.values(), key=lambda block: block["reading_order"]),
+                figure_assets,
+            )
+    return result
+
+
+def _fallback_candidates_from_blocks(
+    blocks: list[dict[str, Any]],
+    block_map: dict[str, dict[str, Any]],
+    figure_assets: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Controlled fallback: build candidates from explicit question headings in
+    extracted blocks when reference mapping produced no candidates."""
+    headings: list[tuple[int, str, str | None]] = []
+    for index, block in enumerate(blocks):
+        match = _EXPLICIT_QUESTION_HEADING.match(str(block.get("text") or ""))
+        if match:
+            headings.append((
+                index,
+                f"Q{match.group(1)}",
+                f"({match.group(2).lower()})" if match.group(2) else None,
+            ))
+    if not headings:
+        return []
+    asset_map = {
+        str(asset.get("asset_id")): asset
+        for asset in figure_assets
+        if asset.get("asset_id")
+    }
+    candidates: list[dict[str, Any]] = []
+    for position, (start, question_number, sub_label) in enumerate(headings):
+        end = headings[position + 1][0] if position + 1 < len(headings) else len(blocks)
+        segment_blocks = [
+            block for block in blocks[start:end]
+            if str(block.get("layout_type") or "").casefold()
+            not in {"page-header", "page-footer"}
+        ]
+        if not segment_blocks:
+            continue
+        block_ids = [block["block_id"] for block in segment_blocks]
+        source_pages = sorted({block["page_number"] for block in segment_blocks})
+        text = _question_content_from_blocks(segment_blocks)
+        if not text:
+            continue
+        asset_ids = list(dict.fromkeys(
+            asset_id
+            for block in segment_blocks
+            for asset_id in block.get("figure_asset_ids", [])
+        ))
+        candidate = {
+            "label": question_number,
+            "original_question_number": question_number,
+            "text": text,
+            "original_text": text,
+            "marks": None,
+            "section_name": None,
+            "section_instructions": None,
+            "source_pages": source_pages,
+            "source_page": source_pages[0] if source_pages else None,
+            "source_block_ids": block_ids,
+            "sub_questions": [],
+            "figure_assets": [asset_map[aid] for aid in asset_ids if aid in asset_map],
+            "ambiguous": True,
+            "ambiguity_notes": [
+                "Fallback: question references recovered from extracted block text."
+            ],
+        }
+        candidates.append(candidate)
+    logger.warning(
+        "LITE_STAGE2_FALLBACK_CANDIDATES: recovered=%d", len(candidates)
+    )
+    return candidates
 
 
 _EXPLICIT_QUESTION_HEADING = re.compile(

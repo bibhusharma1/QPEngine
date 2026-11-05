@@ -18,6 +18,8 @@ from src.masterdeorca import migrations
 
 _password_hash = PasswordHash.recommended()
 _SUBJECT_ID_NAMESPACE = uuid.UUID("bf54f1f5-1d81-4c12-8d70-29b7a414a0e2")
+DATABASE_BACKEND = getattr(settings, "DATABASE_BACKEND", "turso")
+DATABASE_PATH = getattr(settings, "DATABASE_PATH", "/data/masterdeorca.sqlite")
 
 
 class _NormalizedRow(dict):
@@ -143,7 +145,10 @@ class _NormalizedConnection:
         return self
 
     def __exit__(self, *exc):
-        return self._connection.__exit__(*exc)
+        try:
+            return self._connection.__exit__(*exc)
+        except Exception:
+            return None
 
     def __getattr__(self, name):
         return getattr(self._connection, name)
@@ -174,7 +179,7 @@ def _get_connection():
             raw = libsql.connect(url)
         return _NormalizedConnection(raw)
     # Fallback to local SQLite if explicitly needed (not for Render)
-    db_path = getattr(settings, "DATABASE_PATH", "/data/masterdeorca.sqlite")
+    db_path = globals().get("DATABASE_PATH", settings.DATABASE_PATH)
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
     db = sqlite3.connect(db_path, timeout=30, isolation_level="DEFERRED")
     db.row_factory = sqlite3.Row
@@ -184,7 +189,7 @@ def _get_connection():
     db.execute("PRAGMA temp_store=MEMORY")
     return db
     # Fallback to local SQLite if explicitly needed (not for Render)
-    db_path = getattr(settings, "DATABASE_PATH", "/data/masterdeorca.sqlite")
+    db_path = globals().get("DATABASE_PATH", settings.DATABASE_PATH)
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
     db = sqlite3.connect(db_path, timeout=30, isolation_level="DEFERRED")
     db.row_factory = sqlite3.Row
@@ -214,18 +219,39 @@ def _row_factory(cursor, row):
     return row
 
 
+def _is_busy_error(exc: Exception) -> bool:
+    message = str(exc).casefold()
+    return any(marker in message for marker in ("busy", "locked", "idle transaction", "database is locked"))
+
+
+def _retry_db(operation, attempts: int = 5, base_delay: float = 0.05):
+    import time
+    last_error = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return operation()
+        except Exception as exc:
+            last_error = exc
+            if not _is_busy_error(exc) or attempt >= attempts:
+                raise
+            time.sleep(min(base_delay * (2 ** (attempt - 1)), 1.0))
+    if last_error is not None:
+        raise last_error
+
+
 def connect():
-    backend = getattr(settings, "DATABASE_BACKEND", "turso").casefold()
+    backend = str(globals().get("DATABASE_BACKEND", settings.DATABASE_BACKEND)).casefold()
     if backend == "turso":
         db = _get_connection()
-        # Ensure foreign keys if supported
-        try:
-            db.execute("PRAGMA foreign_keys=ON")
-        except Exception:
-            pass
+        # Ensure foreign keys and a bounded busy timeout if supported.
+        for pragma in ("PRAGMA foreign_keys=ON", "PRAGMA busy_timeout=30000"):
+            try:
+                db.execute(pragma)
+            except Exception:
+                pass
         return db
     # sqlite fallback
-    db_path = getattr(settings, "DATABASE_PATH", "/data/masterdeorca.sqlite")
+    db_path = globals().get("DATABASE_PATH", settings.DATABASE_PATH)
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
     db = sqlite3.connect(db_path, timeout=30, isolation_level="DEFERRED")
     db.row_factory = sqlite3.Row
@@ -237,7 +263,7 @@ def connect():
 
 
 def initialize() -> None:
-    backend = getattr(settings, "DATABASE_BACKEND", "turso").casefold()
+    backend = str(globals().get("DATABASE_BACKEND", settings.DATABASE_BACKEND)).casefold()
     if backend == "turso":
         # Initialize Turso schema
         db = _get_connection()
@@ -262,7 +288,7 @@ def initialize() -> None:
             except Exception:
                 pass
         return
-    db_path = getattr(settings, "DATABASE_PATH", "/data/masterdeorca.sqlite")
+    db_path = globals().get("DATABASE_PATH", settings.DATABASE_PATH)
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(db_path, timeout=30) as pragma_db:
         pragma_db.execute("PRAGMA journal_mode=WAL")
@@ -667,12 +693,20 @@ def save_job(job: dict[str, Any]) -> None:
     started_at = job["started_at"]
     error = job.get("error")
     result_json = json.dumps(job.get("result")) if job.get("result") is not None else None
-    with connect() as db:
-        db.execute("""INSERT INTO jobs(job_id, subject, filename, status, stage, started_at, updated_at, error, result_json)
-            VALUES (?,?,?,?,?,?,?,?,?)
-            ON CONFLICT(job_id) DO UPDATE SET status=excluded.status, stage=excluded.stage,
-            updated_at=excluded.updated_at, error=excluded.error, result_json=excluded.result_json""",
-            (job_id, subject, filename, status, stage, started_at, now, error, result_json))
+    def _write():
+        with connect() as db:
+            db.execute(
+                "INSERT INTO jobs(job_id, subject, filename, status, stage, started_at, updated_at, error, result_json) "
+                "VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(job_id) DO UPDATE SET status=excluded.status, "
+                "stage=excluded.stage, updated_at=excluded.updated_at, error=excluded.error, "
+                "result_json=excluded.result_json",
+                (job_id, subject, filename, status, stage, started_at, now, error, result_json),
+            )
+            try:
+                db.commit()
+            except Exception:
+                pass
+    _retry_db(_write)
 
 
 def get_job(job_id: str) -> dict[str, Any] | None:

@@ -126,6 +126,116 @@ def _structured_response_schema() -> dict[str, Any]:
     }
 
 
+def _normalize_block_question(question: Any) -> dict[str, Any]:
+    if not isinstance(question, dict):
+        return {}
+    number = (
+        question.get("question_number")
+        or question.get("number")
+        or question.get("question")
+        or question.get("label")
+        or question.get("id")
+        or question.get("question_no")
+        or question.get("q_number")
+    )
+    block_ids = (
+        question.get("block_ids")
+        or question.get("blocks")
+        or question.get("refs")
+        or question.get("references")
+        or question.get("block_references")
+        or question.get("block_ids_list")
+        or []
+    )
+    sub_questions = (
+        question.get("sub_questions")
+        or question.get("subquestions")
+        or question.get("sub_parts")
+        or question.get("parts")
+        or []
+    )
+    instruction_block_ids = (
+        question.get("instruction_block_ids")
+        or question.get("instruction_blocks")
+        or question.get("instruction_refs")
+        or []
+    )
+    figure_asset_ids = (
+        question.get("figure_asset_ids")
+        or question.get("figure_assets")
+        or question.get("asset_ids")
+        or question.get("assets")
+        or []
+    )
+    ambiguous_block_ids = (
+        question.get("ambiguous_block_ids")
+        or question.get("ambiguous_blocks")
+        or question.get("ambiguous_refs")
+        or []
+    )
+    normalized = dict(question)
+    if number is not None:
+        normalized["question_number"] = str(number).strip()
+    normalized["block_ids"] = list(block_ids) if isinstance(block_ids, list) else [block_ids]
+    normalized["sub_questions"] = [
+        _normalize_block_question(item) for item in sub_questions
+        if isinstance(item, (dict, str))
+    ] if isinstance(sub_questions, list) else []
+    # Coerce string sub-questions into minimal refs.
+    if isinstance(sub_questions, list):
+        coerced = []
+        for item in sub_questions:
+            if isinstance(item, dict):
+                coerced.append(_normalize_block_question(item))
+            elif isinstance(item, str):
+                coerced.append({"label": item, "block_ids": []})
+        normalized["sub_questions"] = coerced
+    normalized["instruction_block_ids"] = list(instruction_block_ids) if isinstance(instruction_block_ids, list) else []
+    normalized["figure_asset_ids"] = [str(x) for x in (figure_asset_ids if isinstance(figure_asset_ids, list) else [figure_asset_ids])]
+    normalized["ambiguous_block_ids"] = list(ambiguous_block_ids) if isinstance(ambiguous_block_ids, list) else []
+    if "marks" in normalized and normalized.get("marks") is not None:
+        normalized["marks"] = str(normalized["marks"])
+    return normalized
+
+
+def _normalize_block_classification_payload(data: Any) -> Any:
+    if isinstance(data, list):
+        data = {"questions": data}
+    if not isinstance(data, dict):
+        return data
+    questions = None
+    for key in ("questions", "items", "results", "classified_questions",
+                "question_references", "question_blocks", "references"):
+        if isinstance(data.get(key), list):
+            questions = data.get(key)
+            break
+    if questions is None:
+        # Maybe nested under "data"
+        nested = data.get("data")
+        if isinstance(nested, dict):
+            return _normalize_block_classification_payload(nested)
+        if isinstance(nested, list):
+            return {"questions": [_normalize_block_question(q) for q in nested]}
+        return data
+    sections = data.get("sections")
+    if not isinstance(sections, list):
+        sections = []
+    normalized = {
+        "questions": [_normalize_block_question(q) for q in questions],
+        "sections": sections,
+        "instruction_block_ids": data.get("instruction_block_ids") or data.get("instructions") or [],
+        "other_block_ids": data.get("other_block_ids") or data.get("other_blocks") or [],
+        "ambiguous_block_ids": data.get("ambiguous_block_ids") or data.get("ambiguous_blocks") or [],
+    }
+    # Preserve extra known fields on sections.
+    normalized_sections = []
+    for section in sections:
+        if isinstance(section, dict):
+            normalized_sections.append(section)
+    normalized["sections"] = normalized_sections
+    return normalized
+
+
 def _strip_fences(text: Any) -> str:
     if not isinstance(text, str):
         raise ValueError(
@@ -500,6 +610,7 @@ Associated figure assets:
                     if isinstance(content, str)
                     else content
                 )
+                data = _normalize_block_classification_payload(data)
                 try:
                     validated = BlockBatchClassification.model_validate(data)
                 except ValidationError as exc:
@@ -533,10 +644,71 @@ Associated figure assets:
                 invalid_blocks = sorted(referenced_blocks - known_blocks)
                 invalid_assets = sorted(referenced_assets - known_assets)
                 if invalid_blocks or invalid_assets:
-                    raise ValueError(
-                        "classification referenced IDs outside this batch: "
-                        f"blocks={invalid_blocks}, assets={invalid_assets}"
+                    logger.warning(
+                        "LITE_STAGE2_BLOCK_BATCH_PRUNED_REFS: batch=%s "
+                        "invalid_blocks=%s invalid_assets=%s",
+                        batch_id,
+                        invalid_blocks,
+                        invalid_assets,
                     )
+                    # Prune unknown references instead of failing the whole batch;
+                    # the candidate resolver/fallback handles missing references.
+                    known_block_set = set(known_blocks)
+                    known_asset_set = set(known_assets)
+                    validated.instruction_block_ids = [
+                        bid for bid in validated.instruction_block_ids
+                        if bid in known_block_set
+                    ]
+                    validated.other_block_ids = [
+                        bid for bid in validated.other_block_ids
+                        if bid in known_block_set
+                    ]
+                    validated.ambiguous_block_ids = [
+                        bid for bid in validated.ambiguous_block_ids
+                        if bid in known_block_set
+                    ]
+                    pruned_sections = []
+                    for section in validated.sections:
+                        section.block_ids = [
+                            bid for bid in section.block_ids
+                            if bid in known_block_set
+                        ]
+                        section.instruction_block_ids = [
+                            bid for bid in section.instruction_block_ids
+                            if bid in known_block_set
+                        ]
+                        pruned_sections.append(section)
+                    validated.sections = pruned_sections
+                    for question in validated.questions:
+                        question.block_ids = [
+                            bid for bid in question.block_ids
+                            if bid in known_block_set
+                        ]
+                        question.instruction_block_ids = [
+                            bid for bid in question.instruction_block_ids
+                            if bid in known_block_set
+                        ]
+                        question.ambiguous_block_ids = [
+                            bid for bid in question.ambiguous_block_ids
+                            if bid in known_block_set
+                        ]
+                        question.figure_asset_ids = [
+                            aid for aid in question.figure_asset_ids
+                            if str(aid) in known_asset_set
+                        ]
+                        for sub in question.sub_questions:
+                            sub.block_ids = [
+                                bid for bid in sub.block_ids
+                                if bid in known_block_set
+                            ]
+                            sub.ambiguous_block_ids = [
+                                bid for bid in sub.ambiguous_block_ids
+                                if bid in known_block_set
+                            ]
+                            sub.figure_asset_ids = [
+                                aid for aid in sub.figure_asset_ids
+                                if str(aid) in known_asset_set
+                            ]
                 logger.info(
                     "LITE_STAGE2_BLOCK_BATCH_SUCCESS: batch=%s attempt=%d/%d "
                     "questions=%d finish_reason=%s token_usage=%s",
