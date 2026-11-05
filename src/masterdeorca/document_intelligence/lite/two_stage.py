@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import tempfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Callable
 
@@ -29,6 +30,14 @@ CACHE_FILENAME = "lite_extraction_cache.json"
 CACHE_VERSION = 1
 STRUCTURING_PROGRESS_FILENAME = "lite_structuring_progress.json"
 STRUCTURING_PROGRESS_VERSION = 1
+
+
+def _concurrency() -> int:
+    try:
+        value = int(getattr(settings, "NVIDIA_API_CONCURRENCY", 2))
+    except (TypeError, ValueError):
+        value = 2
+    return max(1, min(value, 2))
 
 
 def _file_sha256(path: Path) -> str:
@@ -464,41 +473,64 @@ def _classify_layout_blocks(
             logger.warning("LITE_BLOCK_CLASSIFICATION_CACHE_INVALID: error=%s", type(exc).__name__)
 
     block_map = {block["block_id"]: block for block in blocks}
-    classifications = []
     batches = _block_batches(blocks)
-    for index, batch in enumerate(batches):
-        batch_id = hashlib.sha256(
-            "\n".join(block["block_id"] for block in batch).encode("utf-8")
+    batch_ids = [
+        hashlib.sha256(
+            "\\n".join(block["block_id"] for block in batch).encode("utf-8")
         ).hexdigest()[:24]
-        result = path_cache.get(batch_id)
-        if not isinstance(result, dict):
+        for batch in batches
+    ]
+    import threading as _threading
+    cache_write_lock = _threading.Lock()
+    results: list[dict[str, Any] | None] = [None] * len(batches)
+    workers = _concurrency()
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {}
+        for index, batch in enumerate(batches):
+            batch_id = batch_ids[index]
+            cached = path_cache.get(batch_id)
+            if isinstance(cached, dict):
+                results[index] = cached
+                logger.info(
+                    "LITE_STAGE2_BLOCK_BATCH_CACHE_REUSED: batch=%s index=%d/%d",
+                    batch_id,
+                    index + 1,
+                    len(batches),
+                )
+                continue
             batch_pages = {block["page_number"] for block in batch}
             batch_assets = [
                 asset for asset in figure_assets
                 if asset.get("source_page") in batch_pages
             ]
-            result = structurer.classify_blocks(
+            future = executor.submit(
+                structurer.classify_blocks,
                 batch,
                 batch_assets,
                 batch_id=batch_id,
             )
-            path_cache[batch_id] = result
+            futures[future] = index
+        for future in as_completed(futures):
+            index = futures[future]
+            result = future.result()
+            results[index] = result
+            path_cache[batch_ids[index]] = result
             if cache_path is not None:
-                _atomic_json_write(cache_path, {
-                    "version": 2,
-                    "source_sha256": source_digest,
-                    "batch_size": settings.LITE_STAGE2_BLOCK_BATCH_SIZE,
-                    "overlap": settings.LITE_STAGE2_BLOCK_OVERLAP,
-                    "batches": path_cache,
-                })
-        else:
+                with cache_write_lock:
+                    _atomic_json_write(cache_path, {
+                        "version": 2,
+                        "source_sha256": source_digest,
+                        "batch_size": settings.LITE_STAGE2_BLOCK_BATCH_SIZE,
+                        "overlap": settings.LITE_STAGE2_BLOCK_OVERLAP,
+                        "batches": path_cache,
+                    })
             logger.info(
-                "LITE_STAGE2_BLOCK_BATCH_CACHE_REUSED: batch=%s index=%d/%d",
-                batch_id,
+                "LITE_STAGE2_BLOCK_BATCH_SUCCESS: batch=%s index=%d/%d",
+                batch_ids[index],
                 index + 1,
                 len(batches),
             )
-        classifications.append(result)
+    classifications = [result for result in results if isinstance(result, dict)]
     return classifications, block_map
 
 
@@ -1418,9 +1450,10 @@ class LiteTwoStageProcessor:
                     f"Lite rendered {len(images)} page images from {input_format} input {path.name}"
                 )
 
-            page_results: list[tuple[int, dict[str, Any]]] = []
-            for page_number, image_data in images.items():
-                mime = "image/jpeg" if image_data.startswith(b"\xff\xd8\xff") else "image/png"
+            page_results_map: dict[int, dict[str, Any]] = {}
+
+            def _parse_page(page_number: int, image_data: bytes) -> tuple[int, dict[str, Any]]:
+                mime = "image/jpeg" if image_data.startswith(b"\\xff\\xd8\\xff") else "image/png"
                 extension = ".jpg" if mime == "image/jpeg" else ".png"
                 image_name = f"page-{page_number:05d}{extension}"
                 logger.info(
@@ -1464,7 +1497,22 @@ class LiteTwoStageProcessor:
                         f"Nemotron extraction returned empty content for page {page_number} "
                         f"image {image_name} of {path.name}"
                     )
-                page_results.append((page_number, raw))
+                return page_number, raw
+
+            workers = _concurrency()
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                futures = {
+                    executor.submit(_parse_page, page_number, image_data): page_number
+                    for page_number, image_data in images.items()
+                }
+                for future in as_completed(futures):
+                    page_number, raw = future.result()
+                    page_results_map[page_number] = raw
+
+            page_results: list[tuple[int, dict[str, Any]]] = [
+                (page_number, page_results_map[page_number])
+                for page_number in sorted(images)
+            ]
 
             combined = self.nemotron.combine_pages(page_results)
             raw_payload = {
