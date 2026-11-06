@@ -395,12 +395,12 @@ def _client(tmp_path, monkeypatch):
 
     monkeypatch.setattr(database, "DATABASE_PATH", tmp_path / "store" / "db.sqlite")
     monkeypatch.setattr(database, "ADMIN_EMAIL", "admin@example.com")
-    monkeypatch.setattr(database, "ADMIN_PASSWORD", "admin123")
+    monkeypatch.setattr(database, "ADMIN_PASSWORD", "admin@123")
     monkeypatch.setattr(storage, "STORAGE_ROOT", tmp_path / "subjects")
     monkeypatch.setattr(app_module, "STORAGE_ROOT", tmp_path / "subjects")
     monkeypatch.setattr(worker, "start_scheduler", lambda: _NoopHandle())
     with TestClient(app_module.app) as client:
-        response = client.post("/auth/login", json={"email": "admin@example.com", "password": "admin123"})
+        response = client.post("/auth/login", json={"email": "admin@example.com", "password": "admin@123"})
         assert response.status_code == 200
         client.headers.update({"Authorization": f"Bearer {response.json()['access_token']}"})
         yield client

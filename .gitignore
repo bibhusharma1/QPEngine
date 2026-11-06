@@ -25,3 +25,24 @@ wheels/
 
 metadata
 
+# AI assistant taste/learned preferences (local only)
+.commandcode/
+
+# Local data and subjects
+/data/
+subjects/
+output/
+*.log
+
+# Editor/IDE
+.idea/
+.vscode/
+*.swp
+
+# Temporary and generated artifacts
+*.tmp
+*.bak
+*.orig
+totp_qr.png
+nemotron-response.json
+

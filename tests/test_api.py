@@ -14,12 +14,12 @@ from src.masterdeorca import database, storage
 def _client(tmp_path, monkeypatch):
     monkeypatch.setattr(database, "DATABASE_PATH", tmp_path / "store" / "db.sqlite")
     monkeypatch.setattr(database, "ADMIN_EMAIL", "admin@example.com")
-    monkeypatch.setattr(database, "ADMIN_PASSWORD", "admin123")
+    monkeypatch.setattr(database, "ADMIN_PASSWORD", "admin@123")
     monkeypatch.setattr(storage, "STORAGE_ROOT", tmp_path / "subjects")
     monkeypatch.setattr(app_module, "STORAGE_ROOT", tmp_path / "subjects")
     monkeypatch.setattr(app_module, "MAX_UPLOAD_BYTES", 1024)
     with TestClient(app_module.app) as client:
-        response = client.post("/auth/login", json={"email": "admin@example.com", "password": "admin123"})
+        response = client.post("/auth/login", json={"email": "admin@example.com", "password": "admin@123"})
         assert response.status_code == 200
         client.headers.update({"Authorization": f"Bearer {response.json()['access_token']}"})
         yield client
@@ -212,7 +212,7 @@ def test_failed_latest_job_withholds_old_parsed_result(tmp_path, monkeypatch):
 def test_startup_marks_unfinished_jobs_retryable(tmp_path, monkeypatch):
     monkeypatch.setattr(database, "DATABASE_PATH", tmp_path / "store.sqlite")
     monkeypatch.setattr(database, "ADMIN_EMAIL", "admin@example.com")
-    monkeypatch.setattr(database, "ADMIN_PASSWORD", "admin123")
+    monkeypatch.setattr(database, "ADMIN_PASSWORD", "admin@123")
     database.initialize()
     database.save_job({"job_id": "interrupted", "subject": "OperatingSys", "filename": "paper.pdf",
                        "status": "running", "stage": "parsing", "started_at": "2026-01-01T00:00:00+00:00",

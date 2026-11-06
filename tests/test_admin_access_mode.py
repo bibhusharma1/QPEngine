@@ -33,7 +33,7 @@ def test_default_mode_is_edit_and_reported_by_auth_endpoints(tmp_path, monkeypat
         _set_mode(client, "readonly")
         assert client.get("/auth/access-mode").json()["access_mode"] == "readonly"
         # A fresh token after re-login keeps the persisted mode; mode is account state.
-        login = client.post("/auth/login", json={"email": "admin@example.com", "password": "admin123"})
+        login = client.post("/auth/login", json={"email": "admin@example.com", "password": "admin@123"})
         client.headers.update({"Authorization": f"Bearer {login.json()['access_token']}"})
         assert client.get("/auth/access-mode").json()["access_mode"] == "readonly"
 
@@ -65,11 +65,11 @@ def test_readonly_admin_can_read_everything_primary_views(tmp_path, monkeypatch)
 
 def test_readonly_blocks_administrative_writes(tmp_path, monkeypatch):
     with _client(tmp_path, monkeypatch) as client:
-        client.post("/teachers", json={"name": "T", "email": "t@example.com", "department": "CSE"})
+        client.post("/teachers", json={"name": "T", "email": "t@example.com", "password": "teaching1"})
         client.post("/subjects", json={"name": "ExtraSubject"})
         _set_mode(client, "readonly")
         blocked = [
-            client.post("/teachers", json={"name": "T2", "email": "t2@example.com", "department": "CSE"}),
+            client.post("/teachers", json={"name": "T2", "email": "t2@example.com", "password": "teaching1"}),
             client.patch("/teachers/1", json={"name": "Renamed"}),
             client.delete("/teachers/1"),
             client.post("/subjects", json={"name": "MoreSubjects"}),

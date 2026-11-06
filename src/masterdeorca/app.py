@@ -23,7 +23,7 @@ from fastapi.responses import JSONResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import AliasChoices, BaseModel, Field, StrictInt, field_validator
 
-from config.settings import CORS_ORIGINS, JWT_SECRET, MAX_UPLOAD_BYTES, STORAGE_ROOT
+from config.settings import CORS_ORIGINS, JWT_SECRET, MAX_UPLOAD_BYTES, STORAGE_ROOT, DEFAULT_TEACHER_PASSWORD
 from config.outputs import stage_output_dir
 from functions.QuesScrapper.ScrapethePDF.gpu_runtime import GpuRuntimeError, ensure_cuda, runtime_report
 from functions.QuesScrapper.ScrapethePDF.pdf_read import extract_pdf_text
@@ -148,6 +148,29 @@ class LoginRequest(BaseModel):
     password: str = Field(min_length=1, max_length=256)
 
 
+class ChangePasswordRequest(BaseModel):
+    current_password: str = Field(min_length=1, max_length=256)
+    new_password: str = Field(min_length=8, max_length=256)
+    confirm_password: str = Field(min_length=8, max_length=256)
+
+
+class ChangeEmailRequest(BaseModel):
+    new_email: str = Field(min_length=3, max_length=254)
+    confirm_email: str = Field(min_length=3, max_length=254)
+
+    @field_validator("new_email", "confirm_email")
+    @classmethod
+    def valid_email(cls, value: str) -> str:
+        value = value.strip()
+        if "@" not in value or "." not in value.split("@")[-1]:
+            raise ValueError("Invalid email address")
+        return value
+
+
+class ResetPasswordRequest(BaseModel):
+    new_password: str = Field(min_length=8, max_length=256)
+
+
 class SubjectRequest(BaseModel):
     name: str = Field(min_length=1, max_length=80)
 
@@ -159,8 +182,8 @@ class ProcessRequest(BaseModel):
 class TeacherCreate(BaseModel):
     name: str = Field(min_length=1, max_length=120)
     email: str = Field(min_length=3, max_length=254)
-    department: str = Field(max_length=64)
-    password: str | None = Field(default=None, min_length=8, max_length=256)
+    department: str | None = Field(default=None, max_length=64)
+    password: str | None = Field(default=None, max_length=256)
     status: str = "pending"
     subjects: list[str] = Field(default_factory=list)
 
@@ -864,6 +887,8 @@ def generate_question_paper(request: QuestionPaperGenerate, user: Annotated[str,
         if database.get_subject_id(subject) is None:
             raise HTTPException(status_code=404, detail="Subject not found")
         require_subject_access(user, subject)
+        if not database.check_user_subject_permission(user, subject, "generate_papers"):
+            raise HTTPException(status_code=403, detail="Permission denied: generate question papers")
         blueprint = question_papers_service.select_blueprint(subject, request.exam_type, request.blueprint_id)
         if not subject_allowed(user, blueprint.get("subject_id")):
             raise HTTPException(status_code=403, detail="Subject access is not assigned to this account")
@@ -948,6 +973,8 @@ def create_question_paper_draft(request: QuestionPaperGenerate, user: Annotated[
         if database.get_subject_id(subject) is None:
             raise HTTPException(status_code=404, detail="Subject not found")
         require_subject_access(user, subject)
+        if not database.check_user_subject_permission(user, subject, "generate_papers"):
+            raise HTTPException(status_code=403, detail="Permission denied: generate question papers")
         blueprint = question_papers_service.select_blueprint(subject, request.exam_type, request.blueprint_id)
         if not subject_allowed(user, blueprint.get("subject_id")):
             raise HTTPException(status_code=403, detail="Subject access is not assigned to this account")
@@ -971,7 +998,10 @@ def get_question_paper_draft(draft_id: str, user: Annotated[str, Depends(require
 @app.patch("/api/question-papers/drafts/{draft_id}", tags=["question papers"])
 def patch_question_paper_draft(draft_id: str, payload: dict,
                                user: Annotated[str, Depends(require_write_user)]) -> dict:
-    _require_draft(user, draft_id)
+    draft = _require_draft(user, draft_id)
+    subject = draft.get("subject")
+    if subject and not database.check_user_subject_permission(user, str(subject), "generate_papers"):
+        raise HTTPException(status_code=403, detail="Permission denied: generate question papers")
     try:
         return question_papers_service.update_draft(draft_id, payload)
     except KeyError as exc:
@@ -982,7 +1012,10 @@ def patch_question_paper_draft(draft_id: str, payload: dict,
 
 @app.post("/api/question-papers/drafts/{draft_id}/questions", tags=["question papers"])
 def add_question_to_draft(draft_id: str, payload: dict, user: Annotated[str, Depends(require_write_user)]) -> dict:
-    _require_draft(user, draft_id)
+    draft = _require_draft(user, draft_id)
+    subject = draft.get("subject")
+    if subject and not database.check_user_subject_permission(user, str(subject), "generate_papers"):
+        raise HTTPException(status_code=403, detail="Permission denied: generate question papers")
     try:
         question_id, section = payload.get("question_id"), payload.get("section")
         if not isinstance(question_id, str) or not question_id.strip() or not isinstance(section, str) or not section.strip():
@@ -997,7 +1030,10 @@ def add_question_to_draft(draft_id: str, payload: dict, user: Annotated[str, Dep
 @app.patch("/api/question-papers/drafts/{draft_id}/questions/{question_id}", tags=["question papers"])
 def edit_draft_question(draft_id: str, question_id: str, payload: dict,
                         user: Annotated[str, Depends(require_write_user)]) -> dict:
-    _require_draft(user, draft_id)
+    draft = _require_draft(user, draft_id)
+    subject = draft.get("subject")
+    if subject and not database.check_user_subject_permission(user, str(subject), "generate_papers"):
+        raise HTTPException(status_code=403, detail="Permission denied: generate question papers")
     try:
         return question_papers_service.update_draft_question(draft_id, question_id, payload)
     except KeyError as exc:
@@ -1009,7 +1045,10 @@ def edit_draft_question(draft_id: str, question_id: str, payload: dict,
 @app.delete("/api/question-papers/drafts/{draft_id}/questions/{question_id}", tags=["question papers"])
 def remove_draft_question(draft_id: str, question_id: str,
                           user: Annotated[str, Depends(require_write_user)]) -> dict:
-    _require_draft(user, draft_id)
+    draft = _require_draft(user, draft_id)
+    subject = draft.get("subject")
+    if subject and not database.check_user_subject_permission(user, str(subject), "generate_papers"):
+        raise HTTPException(status_code=403, detail="Permission denied: generate question papers")
     try:
         return question_papers_service.remove_draft_question(draft_id, question_id)
     except KeyError as exc:
@@ -1018,8 +1057,11 @@ def remove_draft_question(draft_id: str, question_id: str,
 
 @app.post("/api/question-papers/drafts/{draft_id}/questions/{question_id}/regenerate", tags=["question papers"])
 def regenerate_draft_question(draft_id: str, question_id: str,
-                             user: Annotated[str, Depends(require_write_user)]) -> dict:
-    _require_draft(user, draft_id)
+                              user: Annotated[str, Depends(require_write_user)]) -> dict:
+    draft = _require_draft(user, draft_id)
+    subject = draft.get("subject")
+    if subject and not database.check_user_subject_permission(user, str(subject), "generate_papers"):
+        raise HTTPException(status_code=403, detail="Permission denied: generate question papers")
     try:
         return question_papers_service.regenerate_draft_question(draft_id, question_id)
     except KeyError as exc:
@@ -1031,7 +1073,10 @@ def regenerate_draft_question(draft_id: str, question_id: str,
 @app.put("/api/question-papers/drafts/{draft_id}/question-order", tags=["question papers"])
 def reorder_draft_questions(draft_id: str, payload: dict,
                             user: Annotated[str, Depends(require_write_user)]) -> dict:
-    _require_draft(user, draft_id)
+    draft = _require_draft(user, draft_id)
+    subject = draft.get("subject")
+    if subject and not database.check_user_subject_permission(user, str(subject), "generate_papers"):
+        raise HTTPException(status_code=403, detail="Permission denied: generate question papers")
     try:
         question_ids = payload.get("question_ids")
         if not isinstance(question_ids, list) or any(not isinstance(row, str) for row in question_ids):
@@ -1046,7 +1091,10 @@ def reorder_draft_questions(draft_id: str, payload: dict,
 @app.post("/api/question-papers/drafts/{draft_id}/docx", tags=["question papers"])
 def export_question_paper_draft(draft_id: str, user: Annotated[str, Depends(require_user)],
                                 payload: DraftDocxExport | None = None) -> Response:
-    _require_draft(user, draft_id)
+    draft = _require_draft(user, draft_id)
+    subject = draft.get("subject")
+    if subject and not database.check_user_subject_permission(user, str(subject), "generate_papers"):
+        raise HTTPException(status_code=403, detail="Permission denied: generate question papers")
     try:
         path = question_papers_service.export_draft_docx(
             draft_id, include_processing_accuracy_notice=(payload.include_processing_accuracy_notice if payload else None))
@@ -1068,9 +1116,23 @@ def _question_bank_records(subject: str) -> list[dict]:
 
 @app.post("/auth/login", tags=["authentication"])
 def login(request: LoginRequest) -> dict:
-    if not database.verify_user(request.email, request.password):
-        raise HTTPException(status_code=401, detail="Invalid email or password")
     email = request.email.lower()
+    # Read the current account record from Turso on every attempt.
+    status = database.get_user_status(email)
+    stored_hash = database.get_user_hashed_password(email)
+    password_ok = False
+    if stored_hash is not None:
+        try:
+            password_ok = bool(database._password_hash.verify(request.password, stored_hash))
+        except Exception:
+            password_ok = False
+    if status in {"pending", "disapproved"}:
+        if password_ok:
+            detail = "Account is pending approval" if status == "pending" else "Account access has been revoked"
+            raise HTTPException(status_code=403, detail=detail)
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+    if not database.verify_user(email, request.password):
+        raise HTTPException(status_code=401, detail="Invalid email or password")
     # TOTP-enabled accounts must complete the second factor; no fallback to a
     # password-only token when the TOTP check itself fails.
     totp_info = totp_service.get_user_totp_info(email)
@@ -1086,6 +1148,37 @@ def login(request: LoginRequest) -> dict:
             "message": "TOTP verification required"
         }
     return {"access_token": issue_token(email), "token_type": "bearer"}
+
+
+@app.post("/auth/change-password", tags=["authentication"])
+def change_password(request: ChangePasswordRequest, email: Annotated[str, Depends(require_user)]) -> dict:
+    if request.new_password != request.confirm_password:
+        raise HTTPException(status_code=422, detail="New password and confirmation do not match")
+    if not database.verify_user(email, request.current_password):
+        raise HTTPException(status_code=401, detail="Current password is incorrect")
+    if request.current_password == request.new_password:
+        raise HTTPException(status_code=422, detail="New password must differ from the current password")
+    new_hash = database._password_hash.hash(request.new_password)
+    if not database._password_hash.verify(request.new_password, new_hash):
+        raise HTTPException(status_code=500, detail="Password hashing verification failed.")
+    if not database.set_user_password_by_email(email, new_hash):
+        raise HTTPException(status_code=404, detail="User not found")
+    return {"updated": True}
+
+
+@app.post("/auth/change-email", tags=["authentication"])
+def change_email(request: ChangeEmailRequest, email: Annotated[str, Depends(require_user)]) -> dict:
+    new_email = str(request.new_email).strip().lower()
+    confirm_email = str(request.confirm_email).strip().lower()
+    if new_email != confirm_email:
+        raise HTTPException(status_code=422, detail="New email and confirmation do not match")
+    if new_email == email:
+        raise HTTPException(status_code=422, detail="New email must differ from the current email")
+    if database.get_user_by_email(new_email) is not None:
+        raise HTTPException(status_code=409, detail="Email is already registered")
+    if not database.set_user_email_by_email(email, new_email):
+        raise HTTPException(status_code=409, detail="Email is already registered")
+    return {"email": new_email, "access_token": issue_token(new_email), "token_type": "bearer"}
 
 
 
@@ -1616,12 +1709,10 @@ def _validated_subjects(names: list[str]) -> list[str]:
 
 
 def _teacher(row: dict) -> dict:
-    names = row.get("subject_names")
-    subjects = [name for name in (names or "").split("|") if name] if names is not None \
-        else database.get_teacher_subjects(row["email"])
+    subjects = database.get_teacher_subjects(row["email"])
     return {"id": row["id"], "name": row["name"], "email": row["email"],
             "department": row.get("department") or "", "status": row["status"],
-            "subject_count": row.get("subject_count", len(subjects)), "subjects": subjects,
+            "subject_count": len(subjects), "subjects": subjects,
             "created_at": row["created_at"]}
 
 
@@ -1637,9 +1728,7 @@ def list_teachers_or_users(_: Admin, status: str | None = None, search: str | No
     where = " AND ".join(clauses)
     with database.connect() as db:
         total = db.execute(f"SELECT count(*) FROM users WHERE {where}", args).fetchone()[0]
-        rows = db.execute(f"""SELECT id,name,email,department,status,created_at,
-                (SELECT count(*) FROM teacher_subjects ts WHERE ts.teacher_id=users.id) AS subject_count,
-                (SELECT group_concat(ts.subject_name, '|') FROM teacher_subjects ts WHERE ts.teacher_id=users.id) AS subject_names
+        rows = db.execute(f"""SELECT id,name,email,department,status,created_at
                 FROM users WHERE {where} ORDER BY id LIMIT ? OFFSET ?""",
                           [*args, page_size, (page - 1) * page_size]).fetchall()
     return {"teachers": [_teacher(dict(row)) for row in rows], "total": total}
@@ -1649,19 +1738,44 @@ def list_teachers_or_users(_: Admin, status: str | None = None, search: str | No
 def create_teacher(request: TeacherCreate, _: AdminWrite) -> dict:
     from src.masterdeorca.database import _password_hash
     email = request.email.strip().lower()
-    if "@" not in email or request.status not in {"pending", "approved"}:
+    status = request.status
+    if status in {"authorized"}:
+        status = "approved"
+    elif status in {"unauthorized"}:
+        status = "disapproved"
+    if "@" not in email or status not in {"pending", "approved", "disapproved"}:
         raise HTTPException(status_code=422, detail="Invalid email or teacher status.")
     subjects = _validated_subjects(request.subjects) if request.subjects else list_subject_names()
-    password = request.password or uuid.uuid4().hex
+    if not (request.password or "").strip():
+        password = DEFAULT_TEACHER_PASSWORD
+        password_supplied = False
+    else:
+        password = request.password
+        password_supplied = True
+        if len(password) < 8:
+            raise HTTPException(status_code=422, detail="Password must contain at least 8 characters.")
+    logger.info("Teacher creation started: email=%s password_supplied=%s password_length=%d", email, password_supplied, len(password))
+    password_hash = database._password_hash.hash(password)
+    if not database._password_hash.verify(password, password_hash):
+        logger.error("Teacher creation hashing verification failed: email=%s", email)
+        raise HTTPException(status_code=500, detail="Password hashing verification failed.")
+    logger.info("Teacher creation hashing ok: email=%s algorithm=%s", email, password_hash.split("$", 3)[1] if "$" in password_hash else "argon2")
     now = _now()
     try:
         with database.connect() as db:
-            cur = db.execute("INSERT INTO users(email,name,hashed_password,role,status,department,created_at) VALUES(?,?,?,?,?,?,?)",
-                             (email, request.name.strip(), _password_hash.hash(password), "teacher", request.status, request.department.strip(), now))
+            cur = db.execute("INSERT INTO users(email,name,hashed_password,role,status,created_at) VALUES(?,?,?,?,?,?)",
+                             (email, request.name.strip(), password_hash, "teacher", status, now))
+            row = db.execute("SELECT id,name,email,department,status,hashed_password,created_at FROM users WHERE email=?", (email,)).fetchone()
+            if row is None or not database._password_hash.verify(password, row["hashed_password"]):
+                logger.error("Teacher creation stored-hash verification failed: email=%s user_id=%s", email, (row["id"] if row else None))
+                raise HTTPException(status_code=500, detail="Password storage verification failed.")
+            logger.info("Teacher creation stored-hash verified: email=%s user_id=%s", email, row["id"])
             if subjects:
                 db.executemany("INSERT INTO teacher_subjects(teacher_id, subject_name, created_at) VALUES(?,?,?)",
-                               [(cur.lastrowid, name, now) for name in subjects])
-            row = db.execute("SELECT id,name,email,department,status,created_at FROM users WHERE id=?", (cur.lastrowid,)).fetchone()
+                               [(row["id"], name, now) for name in subjects])
+            database.assign_user_subjects(row["id"], subjects, {}) if subjects else None
+    except HTTPException:
+        raise
     except Exception as exc:
         if "UNIQUE" in str(exc): raise HTTPException(status_code=409, detail="Email already exists.") from exc
         raise
@@ -1678,6 +1792,8 @@ def update_teacher(teacher_id: int, changes: dict, _: AdminWrite) -> dict:
         old = db.execute("SELECT * FROM users WHERE id=? AND role='teacher'", (teacher_id,)).fetchone()
         if not old: raise HTTPException(status_code=404, detail="Teacher not found")
         vals = dict(changes)
+        # Department is no longer managed through teacher workflows.
+        vals.pop("department", None)
         subjects = vals.pop("subjects", None)
         if subjects is not None:
             if not isinstance(subjects, list) or any(not isinstance(item, str) for item in subjects):
@@ -1686,14 +1802,25 @@ def update_teacher(teacher_id: int, changes: dict, _: AdminWrite) -> dict:
         if "email" in vals:
             vals["email"] = str(vals["email"]).strip().lower()
             if "@" not in vals["email"]: raise HTTPException(status_code=422, detail="Invalid email.")
-        if "status" in vals and vals["status"] not in {"pending", "approved", "disapproved"}:
-            raise HTTPException(status_code=422, detail="Invalid teacher status.")
+        if "status" in vals:
+            if vals["status"] == "authorized":
+                vals["status"] = "approved"
+            elif vals["status"] == "unauthorized":
+                vals["status"] = "disapproved"
+            if vals["status"] not in {"pending", "approved", "disapproved"}:
+                raise HTTPException(status_code=422, detail="Invalid teacher status.")
         if "password" in vals:
-            if len(str(vals["password"])) < 8: raise HTTPException(status_code=422, detail="Password must contain at least 8 characters.")
-            vals["hashed_password"] = _password_hash.hash(vals.pop("password"))
+            if not vals["password"]:
+                vals.pop("password", None)
+            else:
+                if len(str(vals["password"])) < 8: raise HTTPException(status_code=422, detail="Password must contain at least 8 characters.")
+                new_pw = vals.pop("password")
+                new_hash = database._password_hash.hash(new_pw)
+                if not database._password_hash.verify(new_pw, new_hash):
+                    raise HTTPException(status_code=500, detail="Password hashing verification failed.")
+                vals["hashed_password"] = new_hash
         if "name" in vals and not str(vals["name"]).strip(): raise HTTPException(status_code=422, detail="Name cannot be empty.")
-        vals["updated_at"] = _now()
-        cols = {"name", "email", "department", "status", "hashed_password"}
+        cols = {"name", "email", "status", "hashed_password"}
         updates = {key: value for key, value in vals.items() if key in cols}
         try:
             if updates:
@@ -1727,7 +1854,16 @@ def list_teacher_subjects(teacher_id: int, _: Admin) -> dict:
     teacher = database.get_teacher_by_id(teacher_id)
     if not teacher:
         raise HTTPException(status_code=404, detail="Teacher not found")
-    return {"teacher_id": teacher_id, "subjects": database.get_teacher_subjects(teacher["email"])}
+    subjects = database.get_user_subjects(teacher_id)
+    if not subjects:
+        # Fall back to legacy assignments without inventing permission values.
+        subjects = [
+            {"subject_name": name, "can_view_papers": None,
+             "can_upload_process": None, "can_manage_question_bank": None,
+             "can_generate_papers": None}
+            for name in database.get_teacher_subjects(teacher["email"])
+        ]
+    return {"teacher_id": teacher_id, "subjects": subjects}
 
 
 @app.post("/teachers/{teacher_id}/subjects", status_code=201, tags=["teachers"])
@@ -1768,6 +1904,20 @@ def get_user_subject_assignments(user_id: int, _: Admin):
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
     return {"user_id": user_id, "subjects": database.get_user_subjects(user_id)}
+
+
+@app.post("/users/{user_id}/reset-password", tags=["users"])
+def reset_user_password(user_id: int, request: ResetPasswordRequest,
+                        _: Annotated[str, Depends(require_admin_write)]) -> dict:
+    user = database.get_user_by_id(user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    new_hash = database._password_hash.hash(request.new_password)
+    if not database._password_hash.verify(request.new_password, new_hash):
+        raise HTTPException(status_code=500, detail="Password hashing verification failed.")
+    if not database.set_user_password_by_id(user_id, new_hash):
+        raise HTTPException(status_code=404, detail="User not found")
+    return {"user_id": user_id, "updated": True}
 
 
 @app.post("/users/{user_id}/subjects", tags=["users"])
@@ -2088,27 +2238,34 @@ def delete_subject(subject: str, _: AdminWrite):
         active = db.execute("SELECT 1 FROM jobs WHERE subject=? AND status IN ('queued','running') LIMIT 1",(subject,)).fetchone()
     if active: raise HTTPException(status_code=409, detail="Cannot delete a subject while a job is running.")
     subject_id = database.get_subject_id(subject)
-    with database.connect() as db:
-        db.execute(
-            "DELETE FROM documents WHERE subject_id=?",
-            (subject_id,),
-        )
-        db.execute(
-            "DELETE FROM question_priorities WHERE question_id IN "
-            "(SELECT question_id FROM question_bank_records WHERE subject_name=?)",
-            (subject,),
-        )
-        db.execute("DELETE FROM question_bank_records WHERE subject_name=?", (subject,))
-        db.execute("DELETE FROM document_reviews WHERE subject_name=?", (subject,))
-        db.execute("DELETE FROM paper_drafts WHERE subject_name=?", (subject,))
-        db.execute("DELETE FROM generated_papers WHERE subject_name=?", (subject,))
-        db.execute("DELETE FROM blueprints WHERE subject_name=?", (subject,))
-        db.execute("DELETE FROM reconciliation_state WHERE subject=?", (subject,))
-        db.execute("DELETE FROM questions WHERE subject_name=?",(subject,)); db.execute("DELETE FROM topics WHERE subject_name=?",(subject,))
-        db.execute("DELETE FROM papers WHERE subject_name=?",(subject,))
-        db.execute("DELETE FROM jobs WHERE subject=?",(subject,)); db.execute("DELETE FROM pdf_reviews WHERE subject=?",(subject,))
-        db.execute("DELETE FROM teacher_subjects WHERE subject_name=?",(subject,))
-        db.execute("DELETE FROM subjects WHERE subject_name=?", (subject,))
+
+    def _do_deletes():
+        ops = [
+            ("DELETE FROM documents WHERE subject_id=?", (subject_id,)),
+            ("DELETE FROM question_priorities WHERE question_id IN (SELECT question_id FROM question_bank_records WHERE subject_name=?)", (subject,)),
+            ("DELETE FROM question_bank_records WHERE subject_name=?", (subject,)),
+            ("DELETE FROM document_reviews WHERE subject_name=?", (subject,)),
+            ("DELETE FROM paper_drafts WHERE subject_name=?", (subject,)),
+            ("DELETE FROM generated_papers WHERE subject_name=?", (subject,)),
+            ("DELETE FROM blueprints WHERE subject_name=?", (subject,)),
+            ("DELETE FROM reconciliation_state WHERE subject=?", (subject,)),
+            ("DELETE FROM questions WHERE subject_name=?", (subject,)),
+            ("DELETE FROM topics WHERE subject_name=?", (subject,)),
+            ("DELETE FROM papers WHERE subject_name=?", (subject,)),
+            ("DELETE FROM jobs WHERE subject=?", (subject,)),
+            ("DELETE FROM pdf_reviews WHERE subject=?", (subject,)),
+            ("DELETE FROM teacher_subjects WHERE subject_name=?", (subject,)),
+            ("DELETE FROM subjects WHERE subject_name=?", (subject,)),
+        ]
+        for sql, params in ops:
+            with database.connect() as db:
+                db.execute(sql, params)
+                try:
+                    db.commit()
+                except Exception:
+                    pass
+
+    database._retry_db(_do_deletes)
     dashboard_metrics_service.invalidate()
 
 

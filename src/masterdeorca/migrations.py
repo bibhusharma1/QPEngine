@@ -8,6 +8,8 @@ MIGRATIONS tuple in execution order.
 from __future__ import annotations
 
 import sqlite3
+import uuid
+from datetime import datetime, timezone
 
 
 def add_column_if_missing(db, table: str, column: str, definition: str) -> None:
@@ -328,6 +330,74 @@ def _migrate_user_subject_permissions(db: sqlite3.Connection) -> None:
     db.execute("CREATE INDEX IF NOT EXISTS idx_user_subject_permissions_subject ON user_subject_permissions(subject_name)")
 
 
+def _migrate_teacher_subjects_to_user_assignments(db: sqlite3.Connection) -> None:
+    """Backfill legacy teacher_subjects into user_subject_assignments/permissions."""
+    # Ensure canonical tables exist.
+    try:
+        db.execute("""CREATE TABLE IF NOT EXISTS user_subject_assignments (
+            assignment_id TEXT PRIMARY KEY,
+            user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            subject_name TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(user_id, subject_name)
+        )""")
+        db.execute("""CREATE TABLE IF NOT EXISTS user_subject_permissions (
+            permission_id TEXT PRIMARY KEY,
+            assignment_id TEXT NOT NULL REFERENCES user_subject_assignments(assignment_id) ON DELETE CASCADE,
+            user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            subject_name TEXT NOT NULL,
+            can_view_papers INTEGER NOT NULL DEFAULT 1,
+            can_upload_process INTEGER NOT NULL DEFAULT 1,
+            can_manage_question_bank INTEGER NOT NULL DEFAULT 1,
+            can_generate_papers INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(assignment_id),
+            UNIQUE(user_id, subject_name)
+        )""")
+    except Exception:
+        pass
+    now = datetime.now(timezone.utc).isoformat()
+    try:
+        rows = db.execute("SELECT teacher_id, subject_name FROM teacher_subjects").fetchall()
+    except Exception:
+        rows = []
+    for row in rows:
+        try:
+            teacher_id = row["teacher_id"] if hasattr(row, "keys") else row[0]
+            subject_name = row["subject_name"] if hasattr(row, "keys") else row[1]
+        except Exception:
+            continue
+        if teacher_id is None or not subject_name:
+            continue
+        user = db.execute("SELECT id FROM users WHERE id=?", (teacher_id,)).fetchone()
+        if not user:
+            continue
+        existing = db.execute(
+            "SELECT assignment_id FROM user_subject_assignments WHERE user_id=? AND subject_name=?",
+            (teacher_id, subject_name),
+        ).fetchone()
+        if existing:
+            assignment_id = existing["assignment_id"] if hasattr(existing, "keys") else existing[0]
+        else:
+            assignment_id = uuid.uuid4().hex
+            try:
+                db.execute(
+                    "INSERT INTO user_subject_assignments(assignment_id,user_id,subject_name,created_at,updated_at) VALUES(?,?,?,?,?)",
+                    (assignment_id, teacher_id, subject_name, now, now),
+                )
+            except Exception:
+                row2 = db.execute(
+                    "SELECT assignment_id FROM user_subject_assignments WHERE user_id=? AND subject_name=?",
+                    (teacher_id, subject_name),
+                ).fetchone()
+                if row2:
+                    assignment_id = row2["assignment_id"] if hasattr(row2, "keys") else row2[0]
+        # Do not auto-grant permissions; leave permission records absent so the
+        # existing policy (no record => no access) applies until an admin sets them.
+
+
 MIGRATIONS: tuple[tuple[str, object], ...] = (
     ("teacher_subjects", _migrate_teacher_subjects),
     ("totp_pending_secret", _migrate_totp_pending_secret),
@@ -341,6 +411,7 @@ MIGRATIONS: tuple[tuple[str, object], ...] = (
     ("ui_configurations_v1", _migrate_ui_configurations),
     ("sqlite_blob_storage_v1", _migrate_sqlite_blob_storage),
     ("user_subject_permissions_v1", _migrate_user_subject_permissions),
+    ("teacher_subjects_to_user_assignments_v1", _migrate_teacher_subjects_to_user_assignments),
 )
 
 

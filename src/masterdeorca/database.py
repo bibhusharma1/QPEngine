@@ -403,17 +403,9 @@ def _init_schema(db) -> None:
             updated_at TEXT NOT NULL, PRIMARY KEY(subject, filename, stage)
         )""")
         migrations.run_migrations(db)
-        existing = db.execute("SELECT email FROM admins WHERE email = ?", (ADMIN_EMAIL,)).fetchone()
-        if existing:
-            db.execute("UPDATE admins SET password_hash = ? WHERE email = ?", (_password_hash.hash(ADMIN_PASSWORD), ADMIN_EMAIL))
-        else:
-            db.execute("INSERT INTO admins(email, password_hash) VALUES (?, ?)", (ADMIN_EMAIL, _password_hash.hash(ADMIN_PASSWORD)))
-        admin = db.execute("SELECT id FROM users WHERE email=?", (ADMIN_EMAIL,)).fetchone()
-        if admin:
-            db.execute("UPDATE users SET name='Administrator', role='admin', status='active', hashed_password=(SELECT password_hash FROM admins WHERE email=?) WHERE email=?", (ADMIN_EMAIL, ADMIN_EMAIL))
-        else:
-            db.execute("INSERT INTO users(email,name,hashed_password,role,status,created_at) VALUES (?,?,?,?,?,?)",
-                       (ADMIN_EMAIL, "Administrator", _password_hash.hash(ADMIN_PASSWORD), "admin", "active", datetime.now(timezone.utc).isoformat()))
+        # Authentication is performed exclusively against the Turso users table.
+        # Do not seed or overwrite administrator credentials from environment
+        # variables; the database is the single source of truth.
 
 
 def _get_row_value(row, key):
@@ -652,8 +644,6 @@ def _row_get(row, key, default=None):
 
 
 def verify_user(email: str, password: str) -> bool:
-    backend = getattr(settings, "DATABASE_BACKEND", "turso").casefold()
-    dev_mode = getattr(settings, "APP_ENV", "render").casefold() == "local" and backend == "sqlite"
     with connect() as db:
         try:
             row = db.execute("SELECT hashed_password,status FROM users WHERE email=?", (email.lower(),)).fetchone()
@@ -673,13 +663,9 @@ def verify_user(email: str, password: str) -> bool:
         except Exception:
             pass
         return False
-    if dev_mode and isinstance(hp, str) and hp == password:
-        return True
     try:
-        return _password_hash.verify(password, hp)
+        return bool(_password_hash.verify(password, hp))
     except Exception:
-        if dev_mode and isinstance(hp, str) and hp == password:
-            return True
         return False
 
 
@@ -737,13 +723,27 @@ def get_teacher_by_id(teacher_id: int) -> dict | None:
 
 
 def get_teacher_subjects(email: str) -> list[str]:
-    """Subject names assigned to a teacher account, ordered (empty when none)."""
+    """Subject names assigned to a teacher account, ordered (empty when none).
+
+    The canonical source is user_subject_assignments. Fall back to the legacy
+    teacher_subjects table for any records not yet migrated.
+    """
     with connect() as db:
         rows = db.execute(
-            """SELECT ts.subject_name FROM teacher_subjects ts
-               JOIN users u ON u.id = ts.teacher_id WHERE u.email=? ORDER BY ts.subject_name""",
+            """SELECT usa.subject_name FROM user_subject_assignments usa
+               JOIN users u ON u.id = usa.user_id WHERE u.email=? ORDER BY usa.subject_name""",
             (email.lower(),)).fetchall()
-    return [row["subject_name"] for row in rows]
+        subjects = [row["subject_name"] for row in rows]
+        if not subjects:
+            try:
+                legacy = db.execute(
+                    """SELECT ts.subject_name FROM teacher_subjects ts
+                       JOIN users u ON u.id = ts.teacher_id WHERE u.email=? ORDER BY ts.subject_name""",
+                    (email.lower(),)).fetchall()
+                subjects = [row["subject_name"] for row in legacy]
+            except Exception:
+                subjects = []
+    return subjects
 
 
 def set_teacher_subjects(teacher_id: int, subject_names: list[str]) -> None:
@@ -753,6 +753,78 @@ def set_teacher_subjects(teacher_id: int, subject_names: list[str]) -> None:
         db.execute("DELETE FROM teacher_subjects WHERE teacher_id=?", (teacher_id,))
         db.executemany("INSERT INTO teacher_subjects(teacher_id, subject_name, created_at) VALUES(?,?,?)",
                        [(teacher_id, name, now) for name in subject_names])
+    # Keep canonical user-subject assignments in sync (preserve existing permissions).
+    sync_user_subject_assignments(teacher_id, subject_names)
+
+
+def sync_user_subject_assignments(user_id: int, subject_names: list[str]) -> None:
+    """Ensure user_subject_assignments/permissions match subject_names.
+
+    Existing permission flags are preserved; only missing assignments/permissions
+    are created with defaults, and removed subjects are deleted.
+    """
+    import uuid as _uuid
+    now = datetime.now(timezone.utc).isoformat()
+    subject_set = {str(s).strip() for s in (subject_names or []) if str(s).strip()}
+    with connect() as db:
+        try:
+            from src.masterdeorca.database import _ensure_user_assignment_tables
+        except Exception:
+            pass
+        try:
+            _ensure_user_assignment_tables(db)
+        except Exception:
+            pass
+        existing_rows = db.execute(
+            "SELECT assignment_id, subject_name FROM user_subject_assignments WHERE user_id=?",
+            (user_id,),
+        ).fetchall()
+        existing_map = {row["subject_name"]: row["assignment_id"] for row in existing_rows}
+        # Remove assignments not in the new set.
+        for subject_name, assignment_id in list(existing_map.items()):
+            if subject_name not in subject_set:
+                db.execute("DELETE FROM user_subject_permissions WHERE assignment_id=?", (assignment_id,))
+                db.execute("DELETE FROM user_subject_assignments WHERE assignment_id=?", (assignment_id,))
+                existing_map.pop(subject_name, None)
+        # Ensure assignments and permissions exist for requested subjects.
+        for subject_name in subject_set:
+            assignment_id = existing_map.get(subject_name)
+            if assignment_id is None:
+                assignment_id = _uuid.uuid4().hex
+                try:
+                    db.execute(
+                        "INSERT INTO user_subject_assignments(assignment_id,user_id,subject_name,created_at,updated_at) VALUES(?,?,?,?,?)",
+                        (assignment_id, user_id, subject_name, now, now),
+                    )
+                except Exception:
+                    row = db.execute(
+                        "SELECT assignment_id FROM user_subject_assignments WHERE user_id=? AND subject_name=?",
+                        (user_id, subject_name),
+                    ).fetchone()
+                    assignment_id = row["assignment_id"] if row else assignment_id
+            else:
+                db.execute(
+                    "UPDATE user_subject_assignments SET updated_at=? WHERE assignment_id=?",
+                    (now, assignment_id),
+                )
+            perm = db.execute(
+                "SELECT 1 FROM user_subject_permissions WHERE assignment_id=?", (assignment_id,)
+            ).fetchone()
+            if not perm:
+                try:
+                    db.execute(
+                        """INSERT INTO user_subject_permissions(permission_id,assignment_id,user_id,subject_name,
+                           can_view_papers,can_upload_process,can_manage_question_bank,can_generate_papers,created_at,updated_at)
+                           VALUES(?,?,?,?,1,1,1,1,?,?)""",
+                        (_uuid.uuid4().hex, assignment_id, user_id, subject_name, now, now),
+                    )
+                except Exception:
+                    pass
+            else:
+                db.execute(
+                    "UPDATE user_subject_permissions SET subject_name=?, updated_at=? WHERE assignment_id=?",
+                    (subject_name, now, assignment_id),
+                )
 
 
 def add_teacher_subject(teacher_id: int, subject_name: str) -> bool:
@@ -774,6 +846,11 @@ def remove_teacher_subject(teacher_id: int, subject_name: str) -> bool:
 def rename_teacher_subject(old_name: str, new_name: str) -> None:
     with connect() as db:
         db.execute("UPDATE teacher_subjects SET subject_name=? WHERE subject_name=?", (new_name, old_name))
+        try:
+            db.execute("UPDATE user_subject_assignments SET subject_name=? WHERE subject_name=?", (new_name, old_name))
+            db.execute("UPDATE user_subject_permissions SET subject_name=? WHERE subject_name=?", (new_name, old_name))
+        except Exception:
+            pass
 
 
 def delete_teacher_subjects(subject_name: str) -> None:
@@ -825,10 +902,59 @@ def get_user_by_id(user_id: int):
         return dict(row) if row else None
 
 
+def set_user_password_by_id(user_id: int, hashed_password: str) -> bool:
+    """Update only the target user's hashed_password. Returns False if no row matched."""
+    with connect() as db:
+        cur = db.execute("UPDATE users SET hashed_password=? WHERE id=?", (hashed_password, user_id))
+    try:
+        return cur.rowcount > 0
+    except Exception:
+        return True
+
+
+def set_user_password_by_email(email: str, hashed_password: str) -> bool:
+    """Update only the identified user's hashed_password. Returns False if no row matched."""
+    with connect() as db:
+        cur = db.execute("UPDATE users SET hashed_password=? WHERE email=?", (hashed_password, email.lower()))
+    try:
+        return cur.rowcount > 0
+    except Exception:
+        return True
+
+
+def set_user_email_by_email(old_email: str, new_email: str) -> bool:
+    """Update only the identified user's email. Returns False on conflict/failure."""
+    try:
+        with connect() as db:
+            cur = db.execute("UPDATE users SET email=? WHERE email=?", (new_email.lower(), old_email.lower()))
+            try:
+                return cur.rowcount > 0
+            except Exception:
+                return True
+    except Exception:
+        return False
+
+
 def get_user_by_email(email: str):
     with connect() as db:
         row = db.execute("SELECT id,email,name,role,status FROM users WHERE email=?", (email.lower(),)).fetchone()
         return dict(row) if row else None
+
+
+def get_user_status(email: str) -> str | None:
+    with connect() as db:
+        row = db.execute("SELECT status FROM users WHERE email=?", (email.lower(),)).fetchone()
+    if not row:
+        return None
+    return _row_get(row, "status")
+
+
+def get_user_hashed_password(email: str) -> str | None:
+    with connect() as db:
+        row = db.execute("SELECT hashed_password FROM users WHERE email=?", (email.lower(),)).fetchone()
+    if not row:
+        return None
+    return _row_get(row, "hashed_password")
 
 
 def list_all_users():
@@ -872,6 +998,17 @@ def assign_user_subjects(user_id: int, subject_names: list[str], permissions: di
             except Exception:
                 pass
             result["assigned"].append(subject_name)
+    # Keep legacy teacher_subjects in sync for teacher accounts.
+    try:
+        user = get_user_by_id(user_id)
+        if user and user.get("role") == "teacher":
+            now2 = datetime.now(timezone.utc).isoformat()
+            with connect() as db2:
+                db2.execute("DELETE FROM teacher_subjects WHERE teacher_id=?", (user_id,))
+                db2.executemany("INSERT INTO teacher_subjects(teacher_id, subject_name, created_at) VALUES(?,?,?)",
+                                [(user_id, name, now2) for name in subject_names])
+    except Exception:
+        pass
     return result
 
 

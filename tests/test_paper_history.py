@@ -115,7 +115,7 @@ def test_history_scoping_and_downloads(tmp_path, monkeypatch):
         # Teachers only see their own papers; administrators see everything.
         teacher_view = client.get("/api/question-papers/history").json()
         assert [item["paper_id"] for item in teacher_view["items"]] == [teacher_paper["paper_id"]]
-        _login(client, "admin@example.com", "admin123")
+        _login(client, "admin@example.com", "admin@123")
         admin_view = client.get("/api/question-papers/history").json()
         assert admin_view["total"] == 2
 
@@ -130,7 +130,7 @@ def test_history_scoping_and_downloads(tmp_path, monkeypatch):
         # Ownership rule: teachers may only delete their own generated papers.
         assert client.delete(f"/api/question-papers/history/{admin_paper['paper_id']}").status_code == 403
         assert client.delete(f"/api/question-papers/history/{teacher_paper['paper_id']}").status_code == 200
-        _login(client, "admin@example.com", "admin123")
+        _login(client, "admin@example.com", "admin@123")
         assert client.get("/api/question-papers/history").json()["total"] == 1
 
 
