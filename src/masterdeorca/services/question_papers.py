@@ -391,7 +391,10 @@ def generate_paper(*, title: str, subject_id: str, exam_type: str, total_marks: 
     if not title.strip() or not exam_type.strip() or not duration.strip():
         raise ValueError("title, exam_type, and duration must not be empty")
     questions = question_bank.read_subject(subject_id)
-    priorities = question_priorities.get_priorities({str(q.get("question_id")) for q in questions if q.get("question_id")})
+    _ids = {str(q.get("question_id")) for q in questions if q.get("question_id")}
+    _overrides = question_priorities.get_priority_overrides(_ids)
+    priorities = {str(q.get("question_id")): _overrides.get(str(q.get("question_id")), q.get("priority") or 1)
+                  for q in questions if q.get("question_id")}
     rng = random.Random(seed)
     used: set[str] = set()
     sections_out: list[dict] = []
@@ -798,7 +801,8 @@ def add_draft_question(draft_id: str, question_id: str, section_name: str) -> di
             raise KeyError("Question not found in this subject's Question Bank")
         if section["marks_per_question"] is not None and _marks(bank_question) != section["marks_per_question"]:
             raise ValueError(f"Question marks must exactly match section marks ({section['marks_per_question']})")
-        priorities = question_priorities.get_priorities({question_id})
+        _overrides = question_priorities.get_priority_overrides({question_id})
+        priorities = {question_id: _overrides.get(question_id, bank_question.get("priority") or 1)}
         item = _paper_question(bank_question, sum(len(s["questions"]) for s in draft["sections"]) + 1, priorities)
         item.update(bank_question_id=question_id, text=item["text"])
         section["questions"].append(item)
@@ -874,7 +878,9 @@ def regenerate_draft_question(draft_id: str, question_id: str) -> dict:
     if not pool:
         raise ValueError("No replacement question is available for this slot")
     replacement = pool[0]
-    priorities = question_priorities.get_priorities({str(replacement.get("question_id"))})
+    _replacement_id = str(replacement.get("question_id"))
+    _overrides = question_priorities.get_priority_overrides({_replacement_id})
+    priorities = {_replacement_id: _overrides.get(_replacement_id, replacement.get("priority") or 1)}
     new_question = _paper_question(replacement, old_question.get("number", index + 1), priorities)
     new_question["number"] = old_question.get("number", index + 1)
     section["questions"][index] = new_question

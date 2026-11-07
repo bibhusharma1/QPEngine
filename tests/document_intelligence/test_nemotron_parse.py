@@ -1,4 +1,4 @@
-import fitz
+import pymupdf
 import httpx
 import pytest
 
@@ -6,7 +6,7 @@ from src.masterdeorca.document_intelligence.llm.scraper_parser.nemotron_parse im
 
 
 def _make_pdf(path, pages=2):
-    doc = fitz.open()
+    doc = pymupdf.open()
     for i in range(pages):
         p = doc.new_page()
         p.insert_text((72, 72), f"Page {i + 1}")

@@ -30,9 +30,14 @@ repeat paid extraction.
 
 Stage 2 first segments the ordered extracted pages into layout blocks
 (`block_id` per block, page-anchored, with per-page figure asset references).
-Blocks are classified in overlapping batches
-(`LITE_STAGE2_BLOCK_BATCH_SIZE`, default 24, overlap 4) by NVIDIA Nemotron 3.5
-Super VL 120B A12B via Chat Completions (`classify_blocks`). Each batch
+Blocks are classified in batches
+(`LITE_STAGE2_BLOCK_BATCH_SIZE`, default 2, overlap 0) by Mistral Large 4
+(`mistralai/mistral-large-4-1t-a52b`) hosted through NVIDIA Chat Completions
+(`classify_blocks`), with bounded concurrency (`LITE_STAGE2_CONCURRENCY`, default 3).
+Reasoning is disabled for this reference-classification request and the configurable
+completion budget defaults to 8,192 tokens; responses ending at the token limit are
+split into smaller batches before they can be accepted.
+Each batch
 request asks only for compact **references** — block IDs, asset IDs, question
 numbers, subpart labels, marks, sections, ambiguity flags — constrained by a
 `BlockBatchClassification` Pydantic schema; referenced IDs are validated
@@ -79,7 +84,7 @@ do not trigger LLM calls.
 Model references:
 
 - [Nemotron 3.5 Parse](https://build.nvidia.com/nvidia/nemotron-3.5-parse)
-- [Nemotron 3.5 Super VL 120B A12B](https://build.nvidia.com/nvidia/nemotron-3.5-super-vl-120b-a12b)
+- [Mistral Large 4](https://build.nvidia.com/mistralai/mistral-large-4-1t-a52b)
 - [NVIDIA NIM Chat Completions API](https://docs.nvidia.com/nim/large-language-models/latest/reference/api-reference.html)
 
 ## Local mode (`PARSER_MODE=local`) — legacy

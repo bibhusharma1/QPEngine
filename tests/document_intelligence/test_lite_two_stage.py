@@ -12,11 +12,194 @@ from src.masterdeorca.document_intelligence.lite.two_stage import (
     _clean_block_text,
     _clean_question_content,
     _extract_layout_blocks,
+    _extract_priority_from_text,
     _question_id,
     _resolve_question_candidates,
+    _block_batches,
+    _logical_block_batches,
+    _classify_layout_blocks,
+    _classify_blocks_adaptive,
     _supplement_explicit_table_questions,
 )
 from functions.QuesParser.ParsePipeLIne.schema import QuestionBank
+
+
+def test_default_plan_splits_24_blocks_into_three_batches_of_eight(monkeypatch):
+    monkeypatch.setattr("config.settings.LITE_STAGE2_BLOCK_BATCH_SIZE", 8)
+    monkeypatch.setattr("config.settings.LITE_STAGE2_BLOCK_OVERLAP", 0)
+    blocks = [{"block_id": f"b{i}"} for i in range(24)]
+
+    batches = _block_batches(blocks)
+
+    assert [len(batch) for batch in batches] == [8, 8, 8]
+    assert [block["block_id"] for batch in batches for block in batch] == [
+        f"b{i}" for i in range(24)
+    ]
+
+
+def test_logical_batches_keep_sibling_question_parts_together():
+    blocks = [
+        {"block_id": "intro", "text": "INSTRUCTIONS: attempt all questions"},
+        {"block_id": "q1a", "text": "Q.1(a) Explain agents.", "page_number": 1},
+        {"block_id": "q1b", "text": "Q.1(b) Discuss search.", "page_number": 1},
+        {"block_id": "q1ctx", "text": "Additional context for Q1.", "page_number": 1},
+        {"block_id": "q2", "text": "Q.2 Describe planning.", "page_number": 1},
+        {"block_id": "footer", "text": "End of paper", "page_number": 1},
+    ]
+
+    batches = _logical_block_batches(blocks)
+
+    assert [[block["block_id"] for block in batch] for batch in batches] == [
+        ["intro"], ["intro", "q1a", "q1b", "q1ctx"],
+        ["intro", "q2", "footer"],
+    ]
+
+
+def test_logical_classifier_sends_page_images_only_with_question_units(monkeypatch):
+    calls = []
+
+    class CapturingStructurer:
+        def classify_blocks(self, blocks, assets, *, batch_id, page_images=None):
+            calls.append((batch_id, [b["block_id"] for b in blocks], page_images))
+            return {"other_block_ids": [b["block_id"] for b in blocks]}
+
+    blocks = [
+        {"block_id": "i1", "text": "Instructions", "page_number": 1},
+        {"block_id": "q1a", "text": "Q.1(a) Explain", "page_number": 1},
+        {"block_id": "q1b", "text": "Q.1(b) Discuss", "page_number": 1},
+        {"block_id": "q2", "text": "Q.2 Define", "page_number": 1},
+    ]
+    classifications, _ = _classify_layout_blocks(
+        CapturingStructurer(), blocks, [], "logical-test", None,
+        page_images={1: b"full-page-image"},
+    )
+
+    assert len(classifications) == 3
+    assert calls[0][2] is None
+    assert calls[1][1] == ["i1", "q1a", "q1b"] and calls[1][2] == {1: b"full-page-image"}
+    assert calls[2][1] == ["i1", "q2"] and calls[2][2] == {1: b"full-page-image"}
+
+
+@pytest.mark.parametrize(
+    ("text", "marks", "priority"),
+    [
+        ("Q 22. Differentiate between CNN and RNN. Marks 3, priority 2", 3, 2),
+        ("Q10 Explain a CNN. Marks: 2 | Priority order 3", 2, 3),
+        ("Q7 Explain topic. Priority = 1", None, 1),
+    ],
+)
+def test_priority_text_examples_keep_marks_and_priority_separate(text, marks, priority):
+    marks_match = re.search(r"\bmarks?\s*[:=]?\s*(\d+)\b", text, re.I)
+    assert (int(marks_match.group(1)) if marks_match else None) == marks
+    assert _extract_priority_from_text(text) == priority
+
+
+def test_question_and_subquestion_keep_explicit_priority_and_pdf_fallback():
+    source = {
+        "label": "Q22",
+        "original_question_number": "Q22",
+        "original_text": "Differentiate between CNN and RNN. Marks 3, priority 2",
+        "text": "Differentiate between CNN and RNN. Marks 3, priority 2",
+        "marks": "3",
+        "priority": 2,
+        "source_pages": [2],
+        "source_block_ids": ["b1"],
+        "sub_questions": [{
+            "label": "(a)",
+            "text": "Explain a CNN.",
+            "original_text": "Explain a CNN.",
+            "source_pages": [2],
+            "source_block_ids": ["b2"],
+            "sub_questions": [{
+                "label": "(i)",
+                "text": "Give an example.",
+                "original_text": "Give an example.",
+                "source_pages": [2],
+                "source_block_ids": ["b3"],
+                "sub_questions": [],
+            }],
+        }],
+    }
+    record = _build_question_record("paper.pdf", source, "stable", default_priority=3)
+    validated = QuestionBank.model_validate({"questions": [record]}).questions[0]
+    assert validated.priority == 2
+    assert validated.sub_questions[0].priority == 3
+    assert validated.sub_questions[0].parent_question_priority == 2
+    assert validated.sub_questions[0].source_block_ids == ["b2"]
+    assert validated.sub_questions[0].original_question_number == "Q22(a)"
+    assert validated.sub_questions[0].parent_question_id == "stable"
+    assert validated.sub_questions[0].sub_questions[0].original_question_number == "Q22(a)(i)"
+    assert validated.sub_questions[0].sub_questions[0].parent_question_ref == "Q22(a)"
+    assert validated.sub_questions[0].sub_questions[0].parent_question_id == validated.sub_questions[0].sub_id
+    assert validated.sub_questions[0].sub_questions[0].parent_question_priority == 3
+
+
+def test_24_block_plan_executes_three_batches_with_bounded_concurrency(monkeypatch):
+    import threading
+    import time
+
+    monkeypatch.setattr("config.settings.LITE_STAGE2_BLOCK_BATCH_SIZE", 8)
+    monkeypatch.setattr("config.settings.LITE_STAGE2_BLOCK_OVERLAP", 0)
+    monkeypatch.setattr("config.settings.LITE_STAGE2_CONCURRENCY", 2)
+    lock = threading.Lock()
+    state = {"active": 0, "maximum": 0, "sizes": []}
+
+    class FakeStructurer:
+        def classify_blocks(self, blocks, figure_assets, *, batch_id):
+            with lock:
+                state["active"] += 1
+                state["maximum"] = max(state["maximum"], state["active"])
+                state["sizes"].append(len(blocks))
+            time.sleep(0.02)
+            with lock:
+                state["active"] -= 1
+            return {"other_block_ids": [block["block_id"] for block in blocks]}
+
+    blocks = [
+        {"block_id": f"b{i}", "page_number": 1, "reading_order": i}
+        for i in range(24)
+    ]
+    classifications, _ = _classify_layout_blocks(
+        FakeStructurer(), blocks, [], "digest", None
+    )
+
+    assert len(classifications) == 3
+    assert sorted(state["sizes"]) == [8, 8, 8]
+    assert state["maximum"] == 2
+
+
+def test_adaptive_split_reuses_successful_child_when_sibling_fails():
+    calls = {"parent": 0, "a": 0, "b": 0}
+    cache = {}
+
+    class FlakyStructurer:
+        def classify_blocks(self, blocks, figure_assets, *, batch_id):
+            if len(blocks) == 2:
+                calls["parent"] += 1
+                raise RuntimeError("truncated response finish_reason=length")
+            key = blocks[0]["block_id"]
+            calls[key] += 1
+            if key == "b" and calls[key] == 1:
+                raise RuntimeError("temporary API failure")
+            return {"other_block_ids": [key]}
+
+    blocks = [{"block_id": "a"}, {"block_id": "b"}]
+    run = lambda: _classify_blocks_adaptive(
+        FlakyStructurer(), blocks, [], batch_id="parent", min_batch_size=1,
+        cache_lookup=lambda child: cache.get(tuple(b["block_id"] for b in child)),
+        cache_store=lambda child, value: cache.__setitem__(
+            tuple(b["block_id"] for b in child), value
+        ),
+    )
+    with pytest.raises(RuntimeError, match="temporary API failure"):
+        run()
+
+    result = run()
+    assert calls == {"parent": 2, "a": 1, "b": 2}
+    assert result == [
+        {"other_block_ids": ["a"]},
+        {"other_block_ids": ["b"]},
+    ]
 
 
 @dataclass
@@ -344,6 +527,7 @@ def test_structuring_retry_reuses_cached_extraction_without_parse_calls(monkeypa
 
 
 def test_multiple_questions_on_one_page_are_structured_sequentially(monkeypatch, tmp_path):
+    monkeypatch.setattr("config.settings.LITE_STAGE2_BLOCK_BATCH_SIZE", 8)
     captured = _setup(
         monkeypatch,
         ["Section A\nAnswer all questions\nQ.1 First question [2]\nQ.2 Second question [3]"],
@@ -363,6 +547,7 @@ def test_multiple_questions_on_one_page_are_structured_sequentially(monkeypatch,
 
 
 def test_question_subparts_are_kept_together_in_one_request(monkeypatch, tmp_path):
+    monkeypatch.setattr("config.settings.LITE_STAGE2_BLOCK_BATCH_SIZE", 8)
     captured = _setup(
         monkeypatch,
         ["Q.1 Explain the process.\na) First part [2]\nb) Second part [3]\n(i) Nested part"],
@@ -406,7 +591,9 @@ def test_failed_classification_batch_is_retried_from_cached_extraction(monkeypat
         output_dir=output,
         on_question_progress=progress_events.append,
     )
-    assert len(captured["structure_calls"]) == 6
+    # Thirty self-contained question units are run independently. The 29
+    # successful unit results are cached; only the failed one is called again.
+    assert len(captured["structure_calls"]) == 31
     assert len(completed["questions"]) == 30
     assert [question["original_question_number"] for question in completed["questions"]] == [
         f"Q{number}" for number in range(1, 31)

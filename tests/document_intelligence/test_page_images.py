@@ -1,7 +1,7 @@
 import io
 from pathlib import Path
 
-import fitz
+import pymupdf
 import pytest
 from PIL import Image
 
@@ -13,7 +13,7 @@ from src.masterdeorca.document_intelligence.page_images import (
 
 
 def _make_pdf(path: Path, pages: int = 2) -> Path:
-    doc = fitz.open()
+    doc = pymupdf.open()
     for i in range(pages):
         page = doc.new_page()
         page.insert_text((72, 72), f"Page {i + 1} content")

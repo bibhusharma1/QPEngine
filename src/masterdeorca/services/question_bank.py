@@ -33,7 +33,9 @@ _SYNC_FIELDS = ("text", "original_text", "cleaned_text", "marks", "section_name"
                 "page_number", "source_pages", "source_pdf", "source_path",
                 "assets", "tables", "original_question_number", "status",
                 "failure_reason", "structuring_error", "validation_issues",
-                "section_instructions", "marks_notation")
+                "section_instructions", "marks_notation", "priority",
+                "source_block_ids", "instruction_block_ids", "parent_question_priority",
+                "parent_question_id")
 
 
 def _now() -> str:
@@ -184,6 +186,33 @@ def _load_bank_rows(subject: str) -> list[dict]:
     return [dict(row) for row in data["questions"] if isinstance(row, dict)]
 
 
+def _atomic_write(path, data) -> None:
+    """Atomically write a bank JSON file and mirror it into the database."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(path)
+    if not isinstance(data, dict):
+        return
+    subject = data.get("subject")
+    if not isinstance(subject, str) or not subject.strip():
+        subject = path.parent.name
+    subject = subject.strip()
+    questions = data.get("questions")
+    if not isinstance(questions, list):
+        return
+    try:
+        from src.masterdeorca import storage
+        storage.ensure_subject(subject)
+    except Exception:
+        pass
+    try:
+        _replace_bank_records(subject, questions)
+    except Exception:
+        pass
+
+
 # ---------------------------------------------------------------------------
 # Flattening parsed records into bank rows
 # ---------------------------------------------------------------------------
@@ -210,16 +239,20 @@ def _record_ref(record: dict, index: int) -> str:
 
 
 def _flatten_records(subject: str, source_pdf: str, records: list, out: list[dict],
-                     *, defaults: dict | None = None, parent_id: str | None = None,
-                     parent_number: str | None = None, chain: str = "",
-                     nested: bool = False) -> None:
+                      *, defaults: dict | None = None, parent_id: str | None = None,
+                      parent_number: str | None = None, chain: str = "",
+                      nested: bool = False, default_priority: int = 1) -> None:
     inherited = defaults or {}
     for index, record in enumerate(records):
         if not isinstance(record, dict):
             continue
         subs = [sub for sub in (record.get("sub_questions") or record.get("subquestions") or [])
                 if isinstance(sub, dict)]
-        own_ref = _record_ref(record, index)
+        own_ref = (
+            str(record.get("original_label") or record.get("label") or "").strip()
+            if nested
+            else _record_ref(record, index)
+        ) or _record_ref(record, index)
         full_identity = f"{chain}|{own_ref}" if chain else own_ref
         record_id = record.get("question_id") or record.get("id")
         if not record_id:
@@ -232,24 +265,30 @@ def _flatten_records(subject: str, source_pdf: str, records: list, out: list[dic
         if subs:
             child_defaults = dict(inherited)
             for key in ("section_name", "source_page", "page_number", "source_pages",
-                        "assets", "figure_paths", "tables", "text"):
+                        "assets", "figure_paths", "tables", "text",
+                        "section_instructions", "instruction_block_ids"):
                 if record.get(key) not in (None, "", []):
                     child_defaults[key] = record.get(key)
+            if record.get("priority") is not None:
+                child_defaults["parent_question_priority"] = record["priority"]
             _flatten_records(subject, source_pdf, subs, out, defaults=child_defaults,
-                             parent_id=record_id, parent_number=number, chain=full_identity,
-                             nested=True)
+                              parent_id=record_id, parent_number=number, chain=full_identity,
+                              nested=True, default_priority=default_priority)
             continue
         _leaf_row(subject, source_pdf, record, inherited, out,
-                  record_id=record_id, number=number)
+                   record_id=record_id, number=number, parent_id=parent_id,
+                   default_priority=default_priority)
     return out
 
 
 def _leaf_row(subject: str, source_pdf: str, record: dict, inherited: dict, out: list[dict],
-              *, record_id: str, number: str | None) -> None:
+               *, record_id: str, number: str | None, parent_id: str | None = None,
+               default_priority: int = 1) -> None:
     row = dict(record)
     row.pop("sub_questions", None)
     row.pop("subquestions", None)
     row["question_id"] = record_id
+    row["parent_question_id"] = row.get("parent_question_id") or parent_id
     row["original_question_number"] = number
     text = _record_text(row) or str(inherited.get("text") or "")
     original_text = row.get("original_text") or row.get("text") or inherited.get("text") or text
@@ -268,7 +307,25 @@ def _leaf_row(subject: str, source_pdf: str, record: dict, inherited: dict, out:
     row["assets"] = row.get("assets") or inherited.get("assets") or []
     row["figure_paths"] = row.get("figure_paths") or inherited.get("figure_paths") or []
     row["tables"] = row.get("tables") or inherited.get("tables") or []
-    row.setdefault("priority", 1)
+    row["section_instructions"] = row.get("section_instructions") or inherited.get("section_instructions")
+    row["instruction_block_ids"] = row.get("instruction_block_ids") or inherited.get("instruction_block_ids") or []
+    row["parent_question_priority"] = (
+        row.get("parent_question_priority")
+        if row.get("parent_question_priority") is not None
+        else inherited.get("parent_question_priority")
+    )
+    resolved_priority = record.get("priority")
+    if resolved_priority is None:
+        resolved_priority = inherited.get("priority")
+    if resolved_priority is None:
+        resolved_priority = default_priority
+    try:
+        resolved_priority = int(resolved_priority)
+    except (TypeError, ValueError):
+        resolved_priority = 1
+    if resolved_priority not in {1, 2, 3}:
+        resolved_priority = 1
+    row["priority"] = resolved_priority
     row.setdefault("metadata", {})
     out.append(row)
 
@@ -286,7 +343,7 @@ def _importable(row: dict) -> bool:
 
 
 def sync_from_parsed(subject: str, parsed_json: Path | str | bytes, source_pdf: str | None = None,
-                     *, protect_edits: bool = False) -> int:
+                      *, protect_edits: bool = False, default_priority: int = 1) -> int:
     """Append valid parsed records to the subject bank; returns the import count.
 
     Records carrying a reconciliation annotation are imported only when their
@@ -309,7 +366,7 @@ def sync_from_parsed(subject: str, parsed_json: Path | str | bytes, source_pdf: 
         source_pdf = (data.get("metadata") or {}).get("source_pdf") if isinstance(data, dict) else None
     if not source_pdf:
         source_pdf = parsed_json.parent.name if isinstance(parsed_json, Path) else "unknown"
-    rows = _flatten_records(subject, str(source_pdf), questions, [])
+    rows = _flatten_records(subject, str(source_pdf), questions, [], default_priority=default_priority)
     # Never synchronize empty question records created by failed/partial parsing.
     rows = [row for row in rows if _record_text(row).strip()]
     rows = [row for row in rows if _importable(row)]
@@ -370,7 +427,7 @@ def sync_from_parsed(subject: str, parsed_json: Path | str | bytes, source_pdf: 
     return imported
 
 
-def sync_pdf(subject: str, filename: str) -> int:
+def sync_pdf(subject: str, filename: str, default_priority: int = 1) -> int:
     """Import a successfully processed document's parsed result into the bank."""
     if database.get_subject_id(subject) is None:
         raise ValueError(f"Unknown subject {subject!r}")
@@ -380,7 +437,7 @@ def sync_pdf(subject: str, filename: str) -> int:
     artifact = database.get_artifact(document["document_id"], "questions_parsed.json")
     if artifact is None:
         raise ValueError(f"Parsed result is not available for {filename}")
-    return sync_from_parsed(subject, artifact["data"], source_pdf=filename)
+    return sync_from_parsed(subject, artifact["data"], source_pdf=filename, default_priority=default_priority)
 
 
 # ---------------------------------------------------------------------------
@@ -866,6 +923,7 @@ def serialize_question_for_api(subject: str, row: dict) -> dict:
     text = _record_text(row)
     return {
         "question_id": row.get("question_id"),
+        "parent_question_id": row.get("parent_question_id"),
         "subject_id": subject,
         "text": text,
         "original_text": row.get("original_text") or text,
@@ -875,13 +933,17 @@ def serialize_question_for_api(subject: str, row: dict) -> dict:
         "original_question_number": row.get("original_question_number"),
         "source_pdf": row.get("source_pdf"),
         "source_path": row.get("source_path"),
+        "source_block_ids": row.get("source_block_ids") or [],
+        "instruction_block_ids": row.get("instruction_block_ids") or [],
+        "section_instructions": row.get("section_instructions"),
+        "parent_question_priority": row.get("parent_question_priority"),
         "page_number": row.get("page_number"),
         "source_pages": row.get("source_pages") or [],
         "assets": row.get("assets") or [],
         "tables": row.get("tables") or [],
         "metadata": row.get("metadata") or {},
         "question_type": row.get("question_type") or row.get("type"),
-        "priority": row.get("priority", 1),
+        "priority": row.get("priority") or 1,
         "created_at": row.get("created_at"),
         "updated_at": row.get("updated_at"),
     }

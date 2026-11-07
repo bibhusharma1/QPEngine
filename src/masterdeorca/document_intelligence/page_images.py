@@ -16,7 +16,7 @@ from typing import Iterator
 
 from PIL import Image
 
-import fitz
+import pymupdf
 
 from config import settings
 
@@ -48,10 +48,10 @@ def _image_to_png_bytes(img: Image.Image) -> bytes:
 
 def _render_pdf_pages(pdf_path: Path, dpi: int) -> Iterator[PageImage]:
     scale = dpi / 72.0
-    doc = fitz.open(str(pdf_path))
+    doc = pymupdf.open(str(pdf_path))
     try:
         for i, page in enumerate(doc):
-            pixmap = page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False)
+            pixmap = page.get_pixmap(matrix=pymupdf.Matrix(scale, scale), alpha=False)
             yield PageImage(
                 page_number=i + 1,
                 data=pixmap.tobytes("png"),
@@ -101,10 +101,10 @@ def _render_docx_pages(docx_path: Path, dpi: int) -> Iterator[PageImage]:
     with tempfile.TemporaryDirectory(prefix="masterdeorca-lite-") as tmpdir:
         pdf_path = _docx_to_pdf(docx_path, Path(tmpdir))
         scale = dpi / 72.0
-        doc = fitz.open(str(pdf_path))
+        doc = pymupdf.open(str(pdf_path))
         try:
             for i, page in enumerate(doc):
-                pixmap = page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False)
+                pixmap = page.get_pixmap(matrix=pymupdf.Matrix(scale, scale), alpha=False)
                 yield PageImage(
                     page_number=i + 1,
                     data=pixmap.tobytes("png"),

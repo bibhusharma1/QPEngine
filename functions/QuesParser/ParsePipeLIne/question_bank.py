@@ -1015,6 +1015,8 @@ def extract_marks(state: PipelineState) -> PipelineState:
             clean_text = remove_structured_table_text(clean_text, q_dict.get("tables", []) or implicit_tables.get(q_index, []))
             raw_marks = q_dict.get("marks")
             total_marks, ind_mark, marks_comps = _parse_marks_notation(raw_marks)
+            priority_match = re.search(r"\bpriority(?:\s*(?:level|order))?\s*[:=]?\s*([123])\b", str(text_raw or ""), re.IGNORECASE)
+            q_priority = int(priority_match.group(1)) if priority_match and priority_match.group(1) in {"1", "2", "3"} else None
 
             # Match question to its actual page(s)
             q_pages = (
@@ -1065,6 +1067,7 @@ def extract_marks(state: PipelineState) -> PipelineState:
                 marks_notation=raw_marks,
                 marks_components=marks_comps,
                 marks_notation_preserved=True,
+                priority=q_priority,
                 sub_questions=sub_qs,
                 section_name=q_dict.get("section_name"),
                 section_instructions=q_dict.get("section_instructions"),

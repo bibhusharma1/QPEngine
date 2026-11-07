@@ -198,6 +198,7 @@ def _run_lite_job(job: dict) -> None:
                     on_structuring=mark_structuring_started,
                     on_event=lambda message: _log(job, message),
                     on_question_progress=update_question_progress,
+                    default_priority=int(job.get("default_priority") or 1),
                 )
             finally:
                 for output in parser_root.rglob("*"):
@@ -261,7 +262,8 @@ def _run_lite_job(job: dict) -> None:
             )
             _update(job, status=completion_status, stage="question_bank_sync", result=result)
             _log(job, "Lite mode: publishing to question bank")
-            imported = sync_question_bank(job["subject"], job["filename"])
+            imported = sync_question_bank(job["subject"], job["filename"],
+                                          default_priority=int(job.get("default_priority") or 1))
             result["question_bank_items"] = imported
             _update(job, status=completion_status, stage="complete", result=result)
             _log(

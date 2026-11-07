@@ -177,7 +177,13 @@ def _get_connection():
                 raw = libsql.connect(url)
         else:
             raw = libsql.connect(url)
-        return _NormalizedConnection(raw)
+        conn = _NormalizedConnection(raw)
+        for pragma in ("PRAGMA busy_timeout=30000", "PRAGMA foreign_keys=ON"):
+            try:
+                conn.execute(pragma)
+            except Exception:
+                pass
+        return conn
     # Fallback to local SQLite if explicitly needed (not for Render)
     db_path = globals().get("DATABASE_PATH", settings.DATABASE_PATH)
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
@@ -822,7 +828,7 @@ def sync_user_subject_assignments(user_id: int, subject_names: list[str]) -> Non
                     pass
             else:
                 db.execute(
-                    "UPDATE user_subject_permissions SET subject_name=?, updated_at=? WHERE assignment_id=?",
+                    "UPDATE user_subject_permissions SET subject_name=?, can_view_papers=1, can_upload_process=1, can_manage_question_bank=1, can_generate_papers=1, updated_at=? WHERE assignment_id=?",
                     (subject_name, now, assignment_id),
                 )
 
@@ -839,7 +845,21 @@ def add_teacher_subject(teacher_id: int, subject_name: str) -> bool:
 def remove_teacher_subject(teacher_id: int, subject_name: str) -> bool:
     with connect() as db:
         cur = db.execute("DELETE FROM teacher_subjects WHERE teacher_id=? AND subject_name=?",
-                           (teacher_id, subject_name))
+                         (teacher_id, subject_name))
+        try:
+            _ensure_user_assignment_tables(db)
+            db.execute("DELETE FROM user_subject_permissions WHERE user_id=? AND subject_name=?",
+                       (teacher_id, subject_name))
+            cur2 = db.execute("DELETE FROM user_subject_assignments WHERE user_id=? AND subject_name=?",
+                              (teacher_id, subject_name))
+            if cur2.rowcount > cur.rowcount:
+                cur = cur2
+        except Exception:
+            pass
+        try:
+            db.commit()
+        except Exception:
+            pass
     return cur.rowcount > 0
 
 
@@ -904,8 +924,15 @@ def get_user_by_id(user_id: int):
 
 def set_user_password_by_id(user_id: int, hashed_password: str) -> bool:
     """Update only the target user's hashed_password. Returns False if no row matched."""
-    with connect() as db:
-        cur = db.execute("UPDATE users SET hashed_password=? WHERE id=?", (hashed_password, user_id))
+    def _write():
+        with connect() as db:
+            cur = db.execute("UPDATE users SET hashed_password=? WHERE id=?", (hashed_password, user_id))
+            try:
+                db.commit()
+            except Exception:
+                pass
+            return cur
+    cur = _retry_db(_write)
     try:
         return cur.rowcount > 0
     except Exception:
@@ -914,8 +941,15 @@ def set_user_password_by_id(user_id: int, hashed_password: str) -> bool:
 
 def set_user_password_by_email(email: str, hashed_password: str) -> bool:
     """Update only the identified user's hashed_password. Returns False if no row matched."""
-    with connect() as db:
-        cur = db.execute("UPDATE users SET hashed_password=? WHERE email=?", (hashed_password, email.lower()))
+    def _write():
+        with connect() as db:
+            cur = db.execute("UPDATE users SET hashed_password=? WHERE email=?", (hashed_password, email.lower()))
+            try:
+                db.commit()
+            except Exception:
+                pass
+            return cur
+    cur = _retry_db(_write)
     try:
         return cur.rowcount > 0
     except Exception:
@@ -924,13 +958,20 @@ def set_user_password_by_email(email: str, hashed_password: str) -> bool:
 
 def set_user_email_by_email(old_email: str, new_email: str) -> bool:
     """Update only the identified user's email. Returns False on conflict/failure."""
-    try:
+    def _write():
         with connect() as db:
             cur = db.execute("UPDATE users SET email=? WHERE email=?", (new_email.lower(), old_email.lower()))
             try:
-                return cur.rowcount > 0
+                db.commit()
             except Exception:
-                return True
+                pass
+            return cur
+    try:
+        cur = _retry_db(_write)
+        try:
+            return cur.rowcount > 0
+        except Exception:
+            return True
     except Exception:
         return False
 
@@ -983,10 +1024,11 @@ def assign_user_subjects(user_id: int, subject_names: list[str], permissions: di
                 row = cur.fetchone()
                 assignment_id = row["assignment_id"] if row else assignment_id
             perm_id = uuid.uuid4().hex
-            can_view = 1 if permissions.get("can_view_papers", True) else 0
-            can_upload = 1 if permissions.get("can_upload_process", True) else 0
-            can_manage = 1 if permissions.get("can_manage_question_bank", True) else 0
-            can_generate = 1 if permissions.get("can_generate_papers", True) else 0
+            # Auto-grant all four capabilities on assignment.
+            can_view = 1
+            can_upload = 1
+            can_manage = 1
+            can_generate = 1
             try:
                 db.execute("""INSERT INTO user_subject_permissions(permission_id,assignment_id,user_id,subject_name,
                     can_view_papers,can_upload_process,can_manage_question_bank,can_generate_papers,created_at,updated_at)

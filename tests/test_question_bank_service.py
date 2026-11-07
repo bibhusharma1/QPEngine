@@ -10,6 +10,7 @@ from src.masterdeorca.services import question_bank
 def _subject(tmp_path, monkeypatch):
     monkeypatch.setattr(storage, "STORAGE_ROOT", tmp_path / "subjects")
     monkeypatch.setattr(database, "DATABASE_PATH", tmp_path / "store" / "db.sqlite")
+    monkeypatch.setattr(database, "DATABASE_BACKEND", "sqlite")
     database.initialize()
     return storage.ensure_subject("Subject")
 
@@ -59,6 +60,46 @@ def test_sync_flattens_nested_records_is_idempotent_and_refreshes_on_reprocess(t
     assert child_a["marks"] == 3
     assert child_a["operator_note"] == "keep me"
     assert len(bank["questions"]) == 2  # prior imported item is preserved, without duplication
+
+
+def test_sync_preserves_question_priorities_and_uses_pdf_default_per_leaf(tmp_path, monkeypatch):
+    paths = _subject(tmp_path, monkeypatch)
+    parsed_path = _parsed(paths, [{
+        "question_id": "q-parent",
+        "original_question_number": "Q22",
+        "original_text": "Parent question",
+        "priority": 2,
+        "source_block_ids": ["b-parent"],
+        "sub_questions": [
+            {
+                "sub_id": "q-a", "original_label": "(a)",
+                "original_text": "Explicit child priority", "priority": 1,
+                "source_block_ids": ["b-a"],
+                "instruction_block_ids": ["b-a-instruction"],
+            },
+            {
+                "sub_id": "q-b", "original_label": "(b)",
+                "original_text": "Default child priority",
+                "source_block_ids": ["b-b"],
+            },
+        ],
+    }])
+
+    question_bank.sync_from_parsed(
+        "Subject", parsed_path, source_pdf="paper.pdf", default_priority=3
+    )
+    rows = question_bank.read_subject("Subject")
+    assert [row["priority"] for row in rows] == [1, 3]
+    assert [row["parent_question_priority"] for row in rows] == [2, 2]
+    assert rows[0]["source_block_ids"] == ["b-a"]
+    assert rows[0]["instruction_block_ids"] == ["b-a-instruction"]
+    assert rows[0]["parent_question_id"] == "q-parent"
+    api_record = question_bank.serialize_question_for_api("Subject", rows[0])
+    assert api_record["priority"] == 1
+    assert api_record["parent_question_priority"] == 2
+    assert api_record["source_block_ids"] == ["b-a"]
+    assert api_record["instruction_block_ids"] == ["b-a-instruction"]
+    assert api_record["parent_question_id"] == "q-parent"
 
 
 def test_failed_or_invalid_result_never_imports_and_invalid_bank_recovers(tmp_path, monkeypatch):

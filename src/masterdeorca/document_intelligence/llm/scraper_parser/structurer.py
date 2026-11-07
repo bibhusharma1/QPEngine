@@ -10,7 +10,9 @@ from src.masterdeorca.document_intelligence.llm.clients.nvidia_keys import KeyMa
 class QuestionStructurer:
     def __init__(self, key_manager: KeyManager | None = None):
         self.key_manager = key_manager or KeyManager()
-        self.structure_model = getattr(settings, "NVIDIA_STRUCTURE_MODEL", "nvidia/llama-3.1-nemotron-70b-instruct")
+        self.structure_model = getattr(
+            settings, "NVIDIA_STRUCTURE_MODEL", "nvidia/nemotron-3.5-super-vl-120b-a12b"
+        )
 
     def structure(self, extracted: dict[str, Any]) -> list[dict[str, Any]]:
         # Send only extracted content + figure refs, no OCR/reparse

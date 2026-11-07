@@ -4,7 +4,7 @@ from email.policy import default
 from io import BytesIO
 from pathlib import Path
 
-import fitz
+import pymupdf
 import httpx
 import pytest
 from docx import Document
@@ -24,12 +24,12 @@ def clear_nvidia_keys(monkeypatch):
 
 
 def _make_pdf(path: Path) -> Path:
-    document = fitz.open()
+    document = pymupdf.open()
     for number in range(1, 3):
         page = document.new_page()
         page.insert_text((72, 72), f"Q.{number} Explain test page {number}.")
         if number == 1:
-            page.draw_rect(fitz.Rect(100, 120, 400, 400), color=(0, 0, 0), width=3)
+            page.draw_rect(pymupdf.Rect(100, 120, 400, 400), color=(0, 0, 0), width=3)
     document.save(path)
     document.close()
     return path

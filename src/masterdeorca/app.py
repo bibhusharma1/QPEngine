@@ -59,14 +59,15 @@ logger = logging.getLogger(__name__)
 def _startup() -> None:
     import os
     # Ensure env vars are picked up
-    backend_env = os.environ.get("DATABASE_BACKEND") or getattr(app_settings, "DATABASE_BACKEND", "turso")
+    backend_env = os.environ.get("DATABASE_BACKEND") or getattr(app_settings, "DATABASE_BACKEND", "sqlite")
     backend = str(backend_env).casefold()
-    if backend != "turso":
-        raise RuntimeError("Only Turso database backend is enabled for Render deployment. Set DATABASE_BACKEND=turso and TURSO_DATABASE_URL/TURSO_AUTH_TOKEN.")
-    if not (os.environ.get("TURSO_DATABASE_URL") or getattr(app_settings, "TURSO_DATABASE_URL", "")):
-        raise RuntimeError("TURSO_DATABASE_URL is not set. Set it in Render environment variables.")
-    if not (os.environ.get("TURSO_AUTH_TOKEN") or getattr(app_settings, "TURSO_AUTH_TOKEN", "")):
-        raise RuntimeError("TURSO_AUTH_TOKEN is not set. Set it in Render environment variables.")
+    if backend not in {"turso","sqlite"}:
+        raise RuntimeError("Unsupported DB backend")
+    if backend == "turso":
+        if not (os.environ.get("TURSO_DATABASE_URL") or getattr(app_settings, "TURSO_DATABASE_URL", "")):
+            raise RuntimeError("TURSO_DATABASE_URL is not set.")
+        if not (os.environ.get("TURSO_AUTH_TOKEN") or getattr(app_settings, "TURSO_AUTH_TOKEN", "")):
+            raise RuntimeError("TURSO_AUTH_TOKEN is not set.")
     if len(JWT_SECRET) < 32 or "replace" in JWT_SECRET.casefold():
         raise RuntimeError("Set QUES_JWT_SECRET to a private random value of at least 32 characters.")
     if getattr(app_settings, "APP_ENV", "").casefold() not in {"local", "render"}:
@@ -79,6 +80,19 @@ def _startup() -> None:
     database.mark_interrupted_jobs()
     with database.connect() as db:
         database.ensure_subject_record(db, app_settings.DEFAULT_SUBJECT)
+        # temporary test seed
+        try:
+            from pwdlib import PasswordHash
+            ph = database._password_hash
+            h = ph.hash("admin@123")
+            now = __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat()
+            db.execute("INSERT OR IGNORE INTO users(email,name,hashed_password,role,status,created_at) VALUES(?,?,?,?,?,?)",
+                       ("admin@example.com","Administrator",h,"admin","active",now))
+            db.execute("INSERT OR IGNORE INTO admins(email,password_hash,access_mode) VALUES(?,?,?)",
+                       ("admin@example.com",h,"edit"))
+            db.commit()
+        except Exception as e:
+            print("seed err", e)
 
 
 @asynccontextmanager
@@ -177,6 +191,7 @@ class SubjectRequest(BaseModel):
 
 class ProcessRequest(BaseModel):
     force: bool = True
+    default_priority: int | None = Field(default=None, ge=1, le=3)
 
 
 class TeacherCreate(BaseModel):
@@ -414,6 +429,10 @@ def health() -> dict:
 @app.get("/api/question-bank", tags=["question bank"])
 def get_question_bank(user: Annotated[str, Depends(require_user)], subject_id: str = Query(...),
                       marks: float | None = Query(default=None, gt=0, allow_inf_nan=False),
+                      search: str | None = Query(default=None),
+                      q: str | None = Query(default=None),
+                      query: str | None = Query(default=None),
+                      search_query: str | None = Query(default=None),
                       page: int = Query(default=1, ge=1),
                       page_size: int = Query(default=25, ge=1, le=200)) -> dict:
     """List persistent subject question-bank records."""
@@ -438,23 +457,45 @@ def get_question_bank(user: Annotated[str, Depends(require_user)], subject_id: s
         value for record in records
         if (value := question_bank_service.normalize_marks(record.get("marks"))) is not None
     })
-    filtered = [record for record in records if marks is None or _numeric_marks(record.get("marks")) == marks]
+    effective_search = search if search is not None else (q if q is not None else (query if query is not None else search_query))
+    search_term = (effective_search or "").strip().lower()
+    searching = bool(search_term)
+    if searching:
+        def _matches_search(record):
+            for field in ("cleaned_text", "original_text", "text", "question", "question_text", "content"):
+                value = record.get(field)
+                if isinstance(value, str) and search_term in value.lower():
+                    return True
+            return False
+        filtered = [record for record in records if _matches_search(record)]
+    else:
+        filtered = [record for record in records if marks is None or _numeric_marks(record.get("marks")) == marks]
     filtered.sort(key=lambda row: (row["subject_id"].casefold(), str(row.get("source_pdf") or "").casefold(), str(row.get("original_question_number") or "").casefold(), str(row["question_id"])))
     total_items = len(filtered)
-    total_pages = (total_items + page_size - 1) // page_size
-    start = (page - 1) * page_size
-    page_items = filtered[start:start + page_size]
-    priorities = question_priorities_service.get_priorities({str(row["question_id"]) for row in page_items})
+    if searching:
+        # Search spans the complete subject bank: return every match without
+        # pagination/truncation.
+        page_items = list(filtered)
+        effective_page = 1
+        effective_page_size = total_items if total_items > 0 else page_size
+        effective_total_pages = 1 if total_items > 0 else 0
+    else:
+        effective_page = page
+        effective_page_size = page_size
+        effective_total_pages = (total_items + page_size - 1) // page_size
+        start = (page - 1) * page_size
+        page_items = filtered[start:start + page_size]
+    priorities = question_priorities_service.get_priority_overrides({str(row["question_id"]) for row in page_items})
     for row in page_items:
-        row["priority"] = priorities.get(str(row["question_id"]), 1)
+        row["priority"] = priorities.get(str(row["question_id"]), row.get("priority") or 1)
         row.update(question_bank_service.serialize_question_for_api(row["subject_id"], row))
         row["resources"] = question_bank_service.list_question_resources(row, row["subject_id"])
         row["has_figures"] = bool(row["resources"]["figures"])
         row["has_tables"] = bool(row["resources"]["tables"])
     return {
         "items": page_items,
-        "pagination": {"page": page, "page_size": page_size, "total_items": total_items, "total_pages": total_pages},
-        "filters": {"subject_id": subject_id, "marks": question_bank_service.normalize_marks(marks)},
+        "pagination": {"page": effective_page, "page_size": effective_page_size, "total_items": total_items, "total_pages": effective_total_pages},
+        "filters": {"subject_id": subject_id, "marks": question_bank_service.normalize_marks(marks), "search": effective_search},
         "available_marks": available_marks,
     }
 
@@ -469,6 +510,7 @@ def get_question_bank_item(question_id: str, user: Annotated[str, Depends(requir
     if database.get_subject_id(subject_id) is None:
         raise HTTPException(status_code=404, detail="Subject not found")
     require_subject_access(user, subject_id)
+    _enforce_subject_permission(user, subject_id, "manage_question_bank")
     try:
         return question_bank_service.get_question_detail(subject_id, question_id)
     except KeyError as exc:
@@ -485,6 +527,7 @@ def get_question_bank_resource(question_id: str, content_type: str, resource_id:
     if database.get_subject_id(subject_id) is None:
         raise HTTPException(status_code=404, detail="Subject not found")
     require_subject_access(user, subject_id)
+    _enforce_subject_permission(user, subject_id, "manage_question_bank")
     if content_type not in {"figure", "table"}:
         raise HTTPException(status_code=422, detail="content_type must be 'figure' or 'table'")
     try:
@@ -515,6 +558,7 @@ def create_question_bank_item(payload: dict, user: Annotated[str, Depends(requir
     if database.get_subject_id(subject) is None:
         raise HTTPException(status_code=404, detail="Subject not found")
     require_subject_access(user, subject)
+    _enforce_subject_permission(user, subject, "manage_question_bank")
     try:
         created = question_bank_service.create_question(subject, payload)
         dashboard_metrics_service.invalidate()
@@ -537,6 +581,7 @@ def update_question_bank_item(question_id: str, payload: dict,
     if database.get_subject_id(subject) is None:
         raise HTTPException(status_code=404, detail="Subject not found")
     require_subject_access(user, subject)
+    _enforce_subject_permission(user, subject, "manage_question_bank")
     try:
         updated = question_bank_service.update_question(subject, question_id, payload)
         dashboard_metrics_service.invalidate()
@@ -557,8 +602,8 @@ def delete_question_bank_item(question_id: str, user: Annotated[str, Depends(req
     if database.get_subject_id(subject) is None:
         raise HTTPException(status_code=404, detail="Subject not found")
     require_subject_access(user, subject)
-    deleted = question_bank_service.delete_question(subject, question_id)
-    if not deleted:
+    _enforce_subject_permission(user, subject, "manage_question_bank")
+    if not question_bank_service.delete_question(subject, question_id):
         raise HTTPException(status_code=404, detail="Question not found in this subject's Question Bank")
     dashboard_metrics_service.invalidate()
 
@@ -568,11 +613,23 @@ def _numeric_marks(value: object) -> float | None:
     return float(normalized) if normalized is not None else None
 
 
+def _enforce_subject_permission(user: str, subject: str, permission: str) -> None:
+    if not database.check_user_subject_permission(user, subject, permission):
+        labels = {
+            "view_papers": "view papers",
+            "upload_process": "upload and process papers",
+            "manage_question_bank": "manage question bank",
+            "generate_papers": "generate question papers",
+        }
+        raise HTTPException(status_code=403, detail=f"Permission denied: {labels.get(permission, permission)}")
+
+
 def _priority_question_ids(subject_id: str | None, user: str) -> set[str]:
     allowed = accessible_subjects(user)
     if subject_id:
         validate_subject_name(subject_id)
         require_subject_access(user, subject_id)
+        _enforce_subject_permission(user, subject_id, "manage_question_bank")
         subjects = [subject_id]
     elif allowed is None:
         subjects = list_subject_names()
@@ -619,6 +676,8 @@ def get_question_priorities(user: Annotated[str, Depends(require_user)], subject
 @app.put("/api/question-priorities", tags=["question bank"])
 def put_question_priority(request: QuestionPriorityUpdate, user: Annotated[str, Depends(require_write_user)]) -> dict:
     _check_priority_question(request.question_id, request.subject_id, user)
+    if request.subject_id:
+        _enforce_subject_permission(user, request.subject_id, "manage_question_bank")
     question_priorities_service.set_priority(request.question_id, request.priority)
     return {"question_id": request.question_id, "subject_id": request.subject_id,
             "priority": request.priority, "updated": True}
@@ -628,6 +687,8 @@ def put_question_priority(request: QuestionPriorityUpdate, user: Annotated[str, 
 def reset_question_priority(question_id: str, user: Annotated[str, Depends(require_write_user)],
                              subject_id: str | None = None) -> dict:
     _check_priority_question(question_id, subject_id, user)
+    if subject_id:
+        _enforce_subject_permission(user, subject_id, "manage_question_bank")
     removed = question_priorities_service.delete_priority(question_id)
     return {"question_id": question_id, "subject_id": subject_id,
             "priority": 1, "reset": removed}
@@ -887,8 +948,7 @@ def generate_question_paper(request: QuestionPaperGenerate, user: Annotated[str,
         if database.get_subject_id(subject) is None:
             raise HTTPException(status_code=404, detail="Subject not found")
         require_subject_access(user, subject)
-        if not database.check_user_subject_permission(user, subject, "generate_papers"):
-            raise HTTPException(status_code=403, detail="Permission denied: generate question papers")
+        _enforce_subject_permission(user, subject, "generate_papers")
         blueprint = question_papers_service.select_blueprint(subject, request.exam_type, request.blueprint_id)
         if not subject_allowed(user, blueprint.get("subject_id")):
             raise HTTPException(status_code=403, detail="Subject access is not assigned to this account")
@@ -973,8 +1033,7 @@ def create_question_paper_draft(request: QuestionPaperGenerate, user: Annotated[
         if database.get_subject_id(subject) is None:
             raise HTTPException(status_code=404, detail="Subject not found")
         require_subject_access(user, subject)
-        if not database.check_user_subject_permission(user, subject, "generate_papers"):
-            raise HTTPException(status_code=403, detail="Permission denied: generate question papers")
+        _enforce_subject_permission(user, subject, "generate_papers")
         blueprint = question_papers_service.select_blueprint(subject, request.exam_type, request.blueprint_id)
         if not subject_allowed(user, blueprint.get("subject_id")):
             raise HTTPException(status_code=403, detail="Subject access is not assigned to this account")
@@ -1000,8 +1059,8 @@ def patch_question_paper_draft(draft_id: str, payload: dict,
                                user: Annotated[str, Depends(require_write_user)]) -> dict:
     draft = _require_draft(user, draft_id)
     subject = draft.get("subject")
-    if subject and not database.check_user_subject_permission(user, str(subject), "generate_papers"):
-        raise HTTPException(status_code=403, detail="Permission denied: generate question papers")
+    if subject:
+        _enforce_subject_permission(user, str(subject), "generate_papers")
     try:
         return question_papers_service.update_draft(draft_id, payload)
     except KeyError as exc:
@@ -1014,8 +1073,8 @@ def patch_question_paper_draft(draft_id: str, payload: dict,
 def add_question_to_draft(draft_id: str, payload: dict, user: Annotated[str, Depends(require_write_user)]) -> dict:
     draft = _require_draft(user, draft_id)
     subject = draft.get("subject")
-    if subject and not database.check_user_subject_permission(user, str(subject), "generate_papers"):
-        raise HTTPException(status_code=403, detail="Permission denied: generate question papers")
+    if subject:
+        _enforce_subject_permission(user, str(subject), "generate_papers")
     try:
         question_id, section = payload.get("question_id"), payload.get("section")
         if not isinstance(question_id, str) or not question_id.strip() or not isinstance(section, str) or not section.strip():
@@ -1032,8 +1091,8 @@ def edit_draft_question(draft_id: str, question_id: str, payload: dict,
                         user: Annotated[str, Depends(require_write_user)]) -> dict:
     draft = _require_draft(user, draft_id)
     subject = draft.get("subject")
-    if subject and not database.check_user_subject_permission(user, str(subject), "generate_papers"):
-        raise HTTPException(status_code=403, detail="Permission denied: generate question papers")
+    if subject:
+        _enforce_subject_permission(user, str(subject), "generate_papers")
     try:
         return question_papers_service.update_draft_question(draft_id, question_id, payload)
     except KeyError as exc:
@@ -1047,8 +1106,8 @@ def remove_draft_question(draft_id: str, question_id: str,
                           user: Annotated[str, Depends(require_write_user)]) -> dict:
     draft = _require_draft(user, draft_id)
     subject = draft.get("subject")
-    if subject and not database.check_user_subject_permission(user, str(subject), "generate_papers"):
-        raise HTTPException(status_code=403, detail="Permission denied: generate question papers")
+    if subject:
+        _enforce_subject_permission(user, str(subject), "generate_papers")
     try:
         return question_papers_service.remove_draft_question(draft_id, question_id)
     except KeyError as exc:
@@ -1060,8 +1119,8 @@ def regenerate_draft_question(draft_id: str, question_id: str,
                               user: Annotated[str, Depends(require_write_user)]) -> dict:
     draft = _require_draft(user, draft_id)
     subject = draft.get("subject")
-    if subject and not database.check_user_subject_permission(user, str(subject), "generate_papers"):
-        raise HTTPException(status_code=403, detail="Permission denied: generate question papers")
+    if subject:
+        _enforce_subject_permission(user, str(subject), "generate_papers")
     try:
         return question_papers_service.regenerate_draft_question(draft_id, question_id)
     except KeyError as exc:
@@ -1075,8 +1134,8 @@ def reorder_draft_questions(draft_id: str, payload: dict,
                             user: Annotated[str, Depends(require_write_user)]) -> dict:
     draft = _require_draft(user, draft_id)
     subject = draft.get("subject")
-    if subject and not database.check_user_subject_permission(user, str(subject), "generate_papers"):
-        raise HTTPException(status_code=403, detail="Permission denied: generate question papers")
+    if subject:
+        _enforce_subject_permission(user, str(subject), "generate_papers")
     try:
         question_ids = payload.get("question_ids")
         if not isinstance(question_ids, list) or any(not isinstance(row, str) for row in question_ids):
@@ -1093,8 +1152,8 @@ def export_question_paper_draft(draft_id: str, user: Annotated[str, Depends(requ
                                 payload: DraftDocxExport | None = None) -> Response:
     draft = _require_draft(user, draft_id)
     subject = draft.get("subject")
-    if subject and not database.check_user_subject_permission(user, str(subject), "generate_papers"):
-        raise HTTPException(status_code=403, detail="Permission denied: generate question papers")
+    if subject:
+        _enforce_subject_permission(user, str(subject), "generate_papers")
     try:
         path = question_papers_service.export_draft_docx(
             draft_id, include_processing_accuracy_notice=(payload.include_processing_accuracy_notice if payload else None))
@@ -1163,6 +1222,9 @@ def change_password(request: ChangePasswordRequest, email: Annotated[str, Depend
         raise HTTPException(status_code=500, detail="Password hashing verification failed.")
     if not database.set_user_password_by_email(email, new_hash):
         raise HTTPException(status_code=404, detail="User not found")
+    stored_hash = database.get_user_hashed_password(email)
+    if stored_hash is None or not database._password_hash.verify(request.new_password, stored_hash):
+        raise HTTPException(status_code=500, detail="Password update verification failed.")
     return {"updated": True}
 
 
@@ -1204,6 +1266,7 @@ def list_pdfs(user: Annotated[str, Depends(require_user)], subject: str) -> dict
     if database.get_subject_id(subject) is None:
         raise HTTPException(status_code=404, detail="Subject not found")
     require_subject_access(user, subject)
+    _enforce_subject_permission(user, subject, "view_papers")
     subject_id = database.get_subject_id(subject)
     manifest = processing_manifest.load_subject(subject)
     manifest_by_name = {item.get("filename"): item for item in manifest["pdfs"]}
@@ -1271,6 +1334,7 @@ def get_processing_manifest(user: Annotated[str, Depends(require_user)], subject
     if database.get_subject_id(subject) is None:
         raise HTTPException(status_code=404, detail="Subject not found")
     require_subject_access(user, subject)
+    _enforce_subject_permission(user, subject, "view_papers")
     with database.connect() as db:
         job_rows = db.execute("SELECT job_id FROM jobs WHERE subject=? ORDER BY started_at", (subject,)).fetchall()
     jobs = [database.get_job(row[0]) for row in job_rows]
@@ -1284,6 +1348,7 @@ async def upload_pdfs(subject: str, user: Annotated[str, Depends(require_write_u
     if database.get_subject_id(subject) is None:
         raise HTTPException(status_code=404, detail="Subject not found. Create the subject before uploading documents.")
     require_subject_access(user, subject)
+    _enforce_subject_permission(user, subject, "upload_process")
     with database.connect() as db:
         subject_id = database.ensure_subject_record(db, subject)
     if not files:
@@ -1349,6 +1414,7 @@ def start_processing(subject: str, filename: str, background: BackgroundTasks,
                      request: ProcessRequest | None = None) -> dict:
     safe_filename = validate_document_filename(filename)
     require_subject_access(user, subject)
+    _enforce_subject_permission(user, subject, "upload_process")
     document = database.get_document(subject, safe_filename)
     if not document:
         raise HTTPException(status_code=404, detail="Document not found in this subject.")
@@ -1384,6 +1450,9 @@ def start_processing(subject: str, filename: str, background: BackgroundTasks,
         except Exception:
             _require_cuda()
     force = request.force if request is not None else True
+    default_priority = request.default_priority if request is not None else None
+    if default_priority is None:
+        default_priority = 1
     previous = database.latest_job(subject, safe_filename)
     if previous and previous["status"] in {"queued", "running"}:
         raise HTTPException(status_code=409, detail={"message": "This document is already processing.", "job_id": previous["job_id"], "status": previous["status"]})
@@ -1408,8 +1477,8 @@ def start_processing(subject: str, filename: str, background: BackgroundTasks,
         _active_jobs.add(key)
     now = datetime.now(timezone.utc).isoformat()
     job = {"job_id": uuid.uuid4().hex, "subject": subject, "filename": safe_filename,
-           "status": "queued", "stage": "queued", "started_at": now, "updated_at": now,
-           "error": None, "result": None}
+            "status": "queued", "stage": "queued", "started_at": now, "updated_at": now,
+            "error": None, "result": None, "default_priority": default_priority}
     database.save_job(job)
     processing_manifest.update_document(subject, safe_filename, status="queued", job=job)
     background.add_task(_run_job, job, key)
@@ -1428,6 +1497,7 @@ def get_job(job_id: str, _: Admin) -> dict:
 def get_pdf_status(user: Annotated[str, Depends(require_user)], subject: str, filename: str) -> dict:
     safe_filename = validate_document_filename(filename)
     require_subject_access(user, subject)
+    _enforce_subject_permission(user, subject, "view_papers")
     if not database.get_document(subject, safe_filename):
         raise HTTPException(status_code=404, detail="Document not found in this subject.")
     job = database.latest_job(subject, safe_filename)
@@ -1439,6 +1509,7 @@ def get_pdf_result(user: Annotated[str, Depends(require_user)], subject: str, fi
                    include_questions: bool = False) -> dict:
     safe_filename = validate_document_filename(filename)
     require_subject_access(user, subject)
+    _enforce_subject_permission(user, subject, "view_papers")
     document = database.get_document(subject, safe_filename)
     if not document:
         raise HTTPException(status_code=404, detail="Document not found in this subject.")
@@ -1460,6 +1531,7 @@ def get_pdf_result(user: Annotated[str, Depends(require_user)], subject: str, fi
 def reconstruct(subject: str, filename: str, user: Annotated[str, Depends(require_write_user)]) -> dict:
     safe_filename = validate_document_filename(filename)
     require_subject_access(user, subject)
+    _enforce_subject_permission(user, subject, "upload_process")
     latest = database.latest_job(subject, safe_filename)
     if latest and latest["status"] not in {"succeeded", "completed_with_errors"}:
         raise HTTPException(status_code=409, detail="The latest processing attempt did not succeed; reconstruction is withheld until a successful fresh run.")
@@ -1475,6 +1547,7 @@ def reconstruct(subject: str, filename: str, user: Annotated[str, Depends(requir
 def download_reconstruction(user: Annotated[str, Depends(require_user)], subject: str, filename: str) -> Response:
     safe_filename = validate_document_filename(filename)
     require_subject_access(user, subject)
+    _enforce_subject_permission(user, subject, "view_papers")
     document = database.get_document(subject, safe_filename)
     if not document:
         raise HTTPException(status_code=404, detail="Document not found in this subject.")
@@ -1788,53 +1861,93 @@ def update_teacher(teacher_id: int, changes: dict, _: AdminWrite) -> dict:
     allowed = {"name", "email", "department", "status", "password", "subjects"}
     if not changes or set(changes) - allowed:
         raise HTTPException(status_code=422, detail="Provide valid teacher fields to update.")
-    with database.connect() as db:
-        old = db.execute("SELECT * FROM users WHERE id=? AND role='teacher'", (teacher_id,)).fetchone()
-        if not old: raise HTTPException(status_code=404, detail="Teacher not found")
-        vals = dict(changes)
-        # Department is no longer managed through teacher workflows.
-        vals.pop("department", None)
-        subjects = vals.pop("subjects", None)
-        if subjects is not None:
-            if not isinstance(subjects, list) or any(not isinstance(item, str) for item in subjects):
-                raise HTTPException(status_code=422, detail="subjects must be an array of subject names.")
-            subjects = _validated_subjects(subjects)
-        if "email" in vals:
-            vals["email"] = str(vals["email"]).strip().lower()
-            if "@" not in vals["email"]: raise HTTPException(status_code=422, detail="Invalid email.")
-        if "status" in vals:
-            if vals["status"] == "authorized":
-                vals["status"] = "approved"
-            elif vals["status"] == "unauthorized":
-                vals["status"] = "disapproved"
-            if vals["status"] not in {"pending", "approved", "disapproved"}:
-                raise HTTPException(status_code=422, detail="Invalid teacher status.")
-        if "password" in vals:
-            if not vals["password"]:
-                vals.pop("password", None)
-            else:
-                if len(str(vals["password"])) < 8: raise HTTPException(status_code=422, detail="Password must contain at least 8 characters.")
-                new_pw = vals.pop("password")
-                new_hash = database._password_hash.hash(new_pw)
-                if not database._password_hash.verify(new_pw, new_hash):
-                    raise HTTPException(status_code=500, detail="Password hashing verification failed.")
-                vals["hashed_password"] = new_hash
-        if "name" in vals and not str(vals["name"]).strip(): raise HTTPException(status_code=422, detail="Name cannot be empty.")
-        cols = {"name", "email", "status", "hashed_password"}
-        updates = {key: value for key, value in vals.items() if key in cols}
-        try:
-            if updates:
-                db.execute("UPDATE users SET " + ",".join(f"{key}=?" for key in updates) + " WHERE id=?", [*updates.values(), teacher_id])
-            if subjects is not None:
-                db.execute("DELETE FROM teacher_subjects WHERE teacher_id=?", (teacher_id,))
-                if subjects:
-                    db.executemany("INSERT INTO teacher_subjects(teacher_id, subject_name, created_at) VALUES(?,?,?)",
-                                   [(teacher_id, name, _now()) for name in subjects])
-        except Exception as exc:
-            if "UNIQUE" in str(exc): raise HTTPException(status_code=409, detail="Email already exists.") from exc
-            raise
-        row = db.execute("SELECT id,name,email,department,status,created_at FROM users WHERE id=?", (teacher_id,)).fetchone()
+    vals = dict(changes)
+    # Department is no longer managed through teacher workflows.
+    vals.pop("department", None)
+    subjects = vals.pop("subjects", None)
     if subjects is not None:
+        if not isinstance(subjects, list) or any(not isinstance(item, str) for item in subjects):
+            raise HTTPException(status_code=422, detail="subjects must be an array of subject names.")
+        subjects = _validated_subjects(subjects)
+    if "email" in vals:
+        vals["email"] = str(vals["email"]).strip().lower()
+        if "@" not in vals["email"]: raise HTTPException(status_code=422, detail="Invalid email.")
+    if "status" in vals:
+        if vals["status"] == "authorized":
+            vals["status"] = "approved"
+        elif vals["status"] == "unauthorized":
+            vals["status"] = "disapproved"
+        if vals["status"] not in {"pending", "approved", "disapproved"}:
+            raise HTTPException(status_code=422, detail="Invalid teacher status.")
+    password_changed = False
+    new_pw_for_verify = None
+    if "password" in vals:
+        if not vals["password"]:
+            vals.pop("password", None)
+        else:
+            if len(str(vals["password"])) < 8: raise HTTPException(status_code=422, detail="Password must contain at least 8 characters.")
+            new_pw = vals.pop("password")
+            # Hash outside the DB transaction to avoid idle/long interactive transactions.
+            new_hash = database._password_hash.hash(new_pw)
+            if not database._password_hash.verify(new_pw, new_hash):
+                raise HTTPException(status_code=500, detail="Password hashing verification failed.")
+            vals["hashed_password"] = new_hash
+            password_changed = True
+            new_pw_for_verify = new_pw
+    if "name" in vals and not str(vals["name"]).strip(): raise HTTPException(status_code=422, detail="Name cannot be empty.")
+    cols = {"name", "email", "status", "hashed_password"}
+    updates = {key: value for key, value in vals.items() if key in cols}
+
+    def _do_update():
+        with database.connect() as db:
+            old = db.execute("SELECT * FROM users WHERE id=? AND role='teacher'", (teacher_id,)).fetchone()
+            if not old: raise HTTPException(status_code=404, detail="Teacher not found")
+            try:
+                if updates:
+                    db.execute("UPDATE users SET " + ",".join(f"{key}=?" for key in updates) + " WHERE id=?", [*updates.values(), teacher_id])
+                if subjects is not None:
+                    db.execute("DELETE FROM teacher_subjects WHERE teacher_id=?", (teacher_id,))
+                    if subjects:
+                        db.executemany("INSERT INTO teacher_subjects(teacher_id, subject_name, created_at) VALUES(?,?,?)",
+                                       [(teacher_id, name, _now()) for name in subjects])
+                if password_changed and new_pw_for_verify is not None:
+                    stored_row = db.execute("SELECT hashed_password FROM users WHERE id=?", (teacher_id,)).fetchone()
+                    stored_hash = None
+                    if stored_row is not None:
+                        try:
+                            stored_hash = stored_row["hashed_password"] if not isinstance(stored_row, (tuple, list)) else stored_row[0]
+                        except Exception:
+                            try:
+                                stored_hash = stored_row[0]
+                            except Exception:
+                                stored_hash = None
+                    if stored_hash is None or not database._password_hash.verify(new_pw_for_verify, stored_hash):
+                        raise HTTPException(status_code=500, detail="Password update verification failed.")
+                try:
+                    db.commit()
+                except Exception:
+                    pass
+            except HTTPException:
+                try:
+                    db.rollback()
+                except Exception:
+                    pass
+                raise
+            except Exception as exc:
+                try:
+                    db.rollback()
+                except Exception:
+                    pass
+                if "UNIQUE" in str(exc): raise HTTPException(status_code=409, detail="Email already exists.") from exc
+                raise
+            row = db.execute("SELECT id,name,email,department,status,created_at FROM users WHERE id=?", (teacher_id,)).fetchone()
+            return row
+    row = database._retry_db(_do_update)
+    if subjects is not None:
+        try:
+            database.sync_user_subject_assignments(teacher_id, subjects)
+        except Exception:
+            pass
         return _teacher({**dict(row), "subject_count": len(subjects), "subject_names": "|".join(subjects)})
     return _teacher(dict(row))
 
@@ -1917,6 +2030,9 @@ def reset_user_password(user_id: int, request: ResetPasswordRequest,
         raise HTTPException(status_code=500, detail="Password hashing verification failed.")
     if not database.set_user_password_by_id(user_id, new_hash):
         raise HTTPException(status_code=404, detail="User not found")
+    stored_hash = database.get_user_hashed_password(user["email"])
+    if stored_hash is None or not database._password_hash.verify(request.new_password, stored_hash):
+        raise HTTPException(status_code=500, detail="Password update verification failed.")
     return {"user_id": user_id, "updated": True}
 
 
@@ -2105,8 +2221,10 @@ def delete_topic(topic_id: int, _: AdminWrite):
 
 
 @app.post("/subjects/{subject}/pdfs/{filename}/questions/import", status_code=201, tags=["questions"])
-def import_pdf_questions(subject: str, filename: str, request: dict | None = None, _: AdminWrite = None) -> dict:
+def import_pdf_questions(subject: str, filename: str, user: Annotated[str, Depends(require_admin_write)], request: dict | None = None) -> dict:
     filename = validate_document_filename(filename)
+    require_subject_access(user, subject)
+    _enforce_subject_permission(user, subject, "manage_question_bank")
     document = database.get_document(subject, filename)
     if not document: raise HTTPException(status_code=404, detail="Subject or document not found")
     parsed_artifact = database.get_artifact(document["document_id"], "questions_parsed.json")
@@ -2149,8 +2267,10 @@ def import_pdf_questions(subject: str, filename: str, request: dict | None = Non
 
 
 @app.patch("/subjects/{subject}/pdfs/{filename}", tags=["PDFs"])
-def update_pdf_review(subject: str, filename: str, request: dict, _: AdminWrite) -> dict:
+def update_pdf_review(subject: str, filename: str, request: dict, user: Annotated[str, Depends(require_admin_write)]) -> dict:
     filename = validate_document_filename(filename)
+    require_subject_access(user, subject)
+    _enforce_subject_permission(user, subject, "upload_process")
     document = database.get_document(subject, filename)
     if not document: raise HTTPException(status_code=404, detail="Document not found")
     status = request.get("review_status")
@@ -2164,8 +2284,10 @@ def update_pdf_review(subject: str, filename: str, request: dict, _: AdminWrite)
 
 
 @app.delete("/subjects/{subject}/pdfs/{filename}", status_code=204, tags=["PDFs"])
-def delete_pdf(subject: str, filename: str, _: AdminWrite):
+def delete_pdf(subject: str, filename: str, user: Annotated[str, Depends(require_admin_write)]):
     filename = validate_document_filename(filename)
+    require_subject_access(user, subject)
+    _enforce_subject_permission(user, subject, "upload_process")
     document = database.get_document(subject, filename)
     if not document: raise HTTPException(status_code=404, detail="Document not found")
     with _active_lock:

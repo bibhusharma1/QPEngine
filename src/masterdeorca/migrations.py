@@ -394,8 +394,52 @@ def _migrate_teacher_subjects_to_user_assignments(db: sqlite3.Connection) -> Non
                 ).fetchone()
                 if row2:
                     assignment_id = row2["assignment_id"] if hasattr(row2, "keys") else row2[0]
-        # Do not auto-grant permissions; leave permission records absent so the
-        # existing policy (no record => no access) applies until an admin sets them.
+        # Auto-grant all four permissions for backfilled assignments.
+        try:
+            perm = db.execute(
+                "SELECT 1 FROM user_subject_permissions WHERE assignment_id=?", (assignment_id,)
+            ).fetchone()
+            if not perm:
+                db.execute(
+                    """INSERT INTO user_subject_permissions(permission_id,assignment_id,user_id,subject_name,
+                       can_view_papers,can_upload_process,can_manage_question_bank,can_generate_papers,created_at,updated_at)
+                       VALUES(?,?,?,?,1,1,1,1,?,?)""",
+                    (__import__("uuid").uuid4().hex, assignment_id, teacher_id, subject_name, now, now),
+                )
+        except Exception:
+            pass
+
+
+def _migrate_subject_permission_backfill(db: sqlite3.Connection) -> None:
+    """Ensure every user_subject_assignment has a permission row with all four flags."""
+    try:
+        _ensure = None
+        try:
+            from src.masterdeorca.database import _ensure_user_assignment_tables
+            _ensure_user_assignment_tables(db)
+        except Exception:
+            pass
+        rows = db.execute("SELECT assignment_id,user_id,subject_name FROM user_subject_assignments").fetchall()
+        now = datetime.now(timezone.utc).isoformat()
+        for row in rows:
+            assignment_id = row["assignment_id"] if hasattr(row, "keys") else row[0]
+            user_id = row["user_id"] if hasattr(row, "keys") else row[1]
+            subject_name = row["subject_name"] if hasattr(row, "keys") else row[2]
+            perm = db.execute("SELECT 1 FROM user_subject_permissions WHERE assignment_id=?", (assignment_id,)).fetchone()
+            if not perm:
+                try:
+                    db.execute(
+                        """INSERT INTO user_subject_permissions(permission_id,assignment_id,user_id,subject_name,
+                           can_view_papers,can_upload_process,can_manage_question_bank,can_generate_papers,created_at,updated_at)
+                           VALUES(?,?,?,?,1,1,1,1,?,?)""",
+                        (__import__("uuid").uuid4().hex, assignment_id, user_id, subject_name, now, now),
+                    )
+                except Exception:
+                    pass
+            else:
+                pass
+    except Exception:
+        pass
 
 
 MIGRATIONS: tuple[tuple[str, object], ...] = (

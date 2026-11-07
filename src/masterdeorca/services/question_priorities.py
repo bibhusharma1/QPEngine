@@ -22,6 +22,18 @@ def get_priorities(question_ids: set[str] | None = None) -> dict[str, int]:
     return priorities
 
 
+def get_priority_overrides(question_ids: set[str] | None = None) -> dict[str, int]:
+    """Return only explicitly stored priority overrides."""
+    with database.connect() as db:
+        rows = db.execute(
+            "SELECT question_id,priority FROM question_priorities ORDER BY question_id"
+        ).fetchall()
+    priorities = {row["question_id"]: row["priority"] for row in rows}
+    if question_ids is not None:
+        return {qid: priorities[qid] for qid in sorted(question_ids) if qid in priorities}
+    return priorities
+
+
 def set_priority(question_id: str, priority: int) -> None:
     now = _now()
     with database.connect() as db:

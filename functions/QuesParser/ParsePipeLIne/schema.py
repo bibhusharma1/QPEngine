@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Annotated, Any, Literal, Union
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import AliasChoices, BaseModel, Field, StrictInt, field_validator
 
 
 SCHEMA_VERSION = "1.1.0"
@@ -56,10 +56,20 @@ class SubQuestion(BaseModel):
     cleaned_text: str = Field(default="", description="Cleaned/normalized question text without printed labels")
     # Original numbering/labels preserved as metadata (not mixed into text)
     original_label: str | None = Field(default=None, description="Original subquestion label from source (e.g., 'a)', '(i)')")
-    original_question_number: str | None = Field(default=None, description="Original question/subquestion number/reference from source")
+    original_question_number: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("original_question_number", "question_number", "number"),
+        description="Original question/subquestion number/reference from source",
+    )
     parent_question_ref: str | None = Field(default=None, description="Parent question reference")
+    parent_question_id: str | None = Field(default=None, description="Stable parent question ID")
     marks: float | None = Field(default=None, description="Marks for this subpart, if separately stated")
     marks_notation: str | None = Field(default=None, description="Original marks string (e.g., '[2]', '2M')")
+    priority: StrictInt | None = Field(default=None, ge=1, le=3, description="Question priority 1-3 if explicitly mentioned")
+    parent_question_priority: StrictInt | None = Field(default=None, ge=1, le=3)
+    source_block_ids: list[str] = Field(default_factory=list)
+    instruction_block_ids: list[str] = Field(default_factory=list)
+    section_instructions: str | None = None
     assets: list[AssetReference] = Field(default_factory=list)
     tables: list[TableReference] = Field(default_factory=list)
     sub_questions: list[SubQuestion] = Field(default_factory=list, description="Nested sub-parts")
@@ -75,7 +85,11 @@ class QuestionRecord(BaseModel):
     cleaned_text: str = Field(default="", description="Cleaned/normalized version without printed labels")
     # Original numbering/labels preserved as metadata (not mixed into text)
     original_label: str | None = Field(default=None, description="Original question label from source (e.g., 'Q1', '1.')")
-    original_question_number: str | None = Field(default=None, description="Original question number/reference from source")
+    original_question_number: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("original_question_number", "question_number", "number"),
+        description="Original question number/reference from source",
+    )
     parent_question_ref: str | None = Field(default=None, description="Parent question reference if any")
 
     # Marks — primary organization axis
@@ -83,6 +97,9 @@ class QuestionRecord(BaseModel):
     marks_notation: str | None = Field(default=None, description="Original marks string (e.g., '[5]', '5M', '2 x 10')")
     marks_components: list[str] = Field(default_factory=list, description="Broken-down marks parts if composite")
     marks_notation_preserved: bool = Field(default=True, description="Whether marks notation like '2 × 10' is preserved separately")
+    priority: StrictInt | None = Field(default=None, ge=1, le=3, description="Question priority 1-3 if explicitly mentioned")
+    source_block_ids: list[str] = Field(default_factory=list)
+    instruction_block_ids: list[str] = Field(default_factory=list)
 
     # Hierarchy
     parent_question_id: str | None = Field(default=None, description="ID of parent question if this is a subpart")
@@ -149,6 +166,7 @@ class UnstructuredQuestionRecord(BaseModel):
     marks_notation: str | None = None
     marks_components: list[str] = Field(default_factory=list)
     marks_notation_preserved: bool = True
+    priority: StrictInt | None = Field(default=None, ge=1, le=3, description="Question priority 1-3 if explicitly mentioned")
     sub_questions: list[SubQuestion] = Field(default_factory=list)
     section_name: str | None = None
     section_instructions: str | None = None
