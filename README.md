@@ -49,16 +49,31 @@ uv sync --extra turso       # Turso scaffold deps (unverified)
 
 ### 2b. With pip
 
-Install directly from `pyproject.toml`:
+Install directly from `pyproject.toml` (no `requirements.txt` needed):
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-pip install -e ".[dev]"      # or: pip install .  (runtime only)
+
+# Runtime dependencies only:
+python -m pip install .
+
+# Runtime + development dependencies:
+python -m pip install -e ".[dev]"
+
+# Optional extras:
+python -m pip install -e ".[ocr-gpu]"   # local GPU OCR (Linux, Python <3.12)
+python -m pip install -e ".[turso]"     # Turso scaffold deps (unverified)
+
+# Run backend
 uvicorn src.masterdeorca.app:app --reload --host 0.0.0.0 --port 8000
 ```
 
-Optional extras: `pip install -e ".[ocr-gpu]"` or `pip install -e ".[turso]"`.
+How it works: pip reads `pyproject.toml` (`[project]` for metadata/runtime deps,
+`[project.optional-dependencies]` for `dev`/`ocr-gpu`/`turso`, and `[build-system]`
+for the build backend), then builds/installs the project and its declared
+dependencies. Keep `pyproject.toml` as the single source of truth; use `uv.lock`
+for reproducible uv installs and `pip install -e ".[dev]"` for pip installs.
 
 ### 2c. With Docker
 
