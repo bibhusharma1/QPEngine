@@ -1,29 +1,105 @@
 # MasterDeOrca
 
-MasterDeOrca is a FastAPI-based system for processing question papers (PDF, DOCX, PNG, JPG/JPEG), extracting questions/figures/tables, storing them in a Question Bank, and generating papers/reconstructions.
+FastAPI backend that turns examination-paper documents (PDF, DOCX, PNG, JPG/JPEG) into a
+validated, editable Question Bank and generates question-paper DOCX files from that bank.
 
-## Prerequisites
-- Python 3.11+
-- `uv` or `pip`
-- Docker (optional) for containerized runs
-- NVIDIA API key(s) only if using `PARSER_MODE=llm`
+## Technologies
 
-## Quick Start (Local Development)
-1. Copy `.env.example` to `.env` and configure values
-2. Install dependencies: `pip install -e ".[dev]"` or `uv sync`
-3. Start the API: `uvicorn src.masterdeorca.app:app --reload --host 0.0.0.0 --port 8000`
-4. Open Swagger UI: `http://localhost:8000/docs`
+Python 3.11+, FastAPI, uvicorn, SQLite, PyMuPDF, python-docx, Pydantic v2, pwdlib (Argon2),
+PyJWT, pyotp, cryptography, httpx. Optional: LibreOffice (DOCX rasterization), PaddleOCR GPU
+(local mode).
 
-## Processing Modes
-- `PARSER_MODE=local` - uses existing local Scrapper/Parser (GPU supported where available)
-- `PARSER_MODE=llm` - NVIDIA Lite parser: Nemotron 3.5 Parse per-page extraction, Nemotron Super VL batched block classification, then deterministic Python question assembly with Pydantic validation, atomic progress saving and resume support
+## Architecture (short)
 
-See `docs/` for full documentation. The authoritative backend reference is
-[docs/BACKEND_ARCHITECTURE.md](docs/BACKEND_ARCHITECTURE.md).
+Single FastAPI process hosts routes, background jobs, and a reconciliation worker thread.
+Document intelligence runs in two modes selected by `PARSER_MODE`: `llm` (active NVIDIA Lite
+two-stage parser: Nemotron 3.5 Parse + Nemotron Super VL + deterministic assembly) and `local`
+(legacy PyMuPDF/GPU-OCR/LangGraph pipeline). Persistent Question Banks are per-subject JSON
+files; administration, jobs, RBAC and TOTP state live in SQLite.
 
+See [docs/architecture.md](docs/architecture.md).
 
-## Two Independent Startup Options
-- **Local server (GPU/local deps):** `PARSER_MODE=local` - uses existing local Scrapper/Parser. Start: `uvicorn src.masterdeorca.app:app --host 0.0.0.0 --port 8000`
-- **Lite server (NVIDIA API):** `PARSER_MODE=llm` - uses Nemotron Parse extraction + Nemotron Super VL block classification with deterministic question assembly; no local OCR/GPU deps. Start: `PARSER_MODE=llm uvicorn src.masterdeorca.app:app --host 0.0.0.0 --port 8000`
+## Installation and running
 
-Same app/routes/schemas/auth/DB/storage/port 8000. Switch by running the other deployment.
+Dependencies are declared in `pyproject.toml` (single source of truth; no
+`requirements.txt`). Python 3.11+ required.
+
+### 1. Configure environment
+
+```bash
+cp .env.example .env
+# edit .env: set QUES_JWT_SECRET (>=32 chars), QUES_ADMIN_EMAIL/PASSWORD, NVIDIA_API (if PARSER_MODE=llm), etc.
+```
+
+### 2a. With uv (recommended)
+
+Uses the existing `uv.lock` for reproducible installs.
+
+```bash
+uv sync                      # installs project + dev deps into .venv
+uv run uvicorn src.masterdeorca.app:app --reload --host 0.0.0.0 --port 8000
+```
+
+Optional extras:
+
+```bash
+uv sync --extra ocr-gpu     # local GPU OCR (Linux, Python <3.12)
+uv sync --extra turso       # Turso scaffold deps (unverified)
+```
+
+### 2b. With pip
+
+Install directly from `pyproject.toml`:
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -e ".[dev]"      # or: pip install .  (runtime only)
+uvicorn src.masterdeorca.app:app --reload --host 0.0.0.0 --port 8000
+```
+
+Optional extras: `pip install -e ".[ocr-gpu]"` or `pip install -e ".[turso]"`.
+
+### 2c. With Docker
+
+Build and run the existing image (Lite/NVIDIA mode by default):
+
+```bash
+docker build -t masterdeorca .
+docker run -p 8000:8000 --env-file .env masterdeorca
+```
+
+Or with compose profiles:
+
+```bash
+docker compose --profile full build && docker compose --profile full up -d   # full (local parser + GPU)
+docker compose --profile lite build && docker compose --profile lite up -d   # lite (NVIDIA API only)
+```
+
+Swagger UI: `http://localhost:8000/docs`.
+
+Processing modes (set `PARSER_MODE` in `.env`):
+- `local` — legacy local Scrapper/Parser (GPU optional).
+- `llm` — NVIDIA Lite parser (no local OCR/GPU deps).
+
+## Environment configuration
+
+All settings come from `.env` / environment variables. See `.env.example` and
+[docs/deployment.md](docs/deployment.md). Never commit secrets.
+
+## Documentation
+
+- [Architecture](docs/architecture.md)
+- [Backend structure](docs/backend-structure.md)
+- [API reference](docs/api-reference.md)
+- [Database](docs/database.md)
+- [Authentication & permissions](docs/authentication-permissions.md)
+- [Document processing](docs/document-processing.md)
+- [Question extraction](docs/question-extraction.md)
+- [AI models](docs/ai-models.md)
+- [Jobs & errors](docs/jobs-and-errors.md)
+- [Deployment](docs/deployment.md)
+- [Development guide](docs/development-guide.md)
+- [Complete workflow](docs/complete-workflow.md)
+- Deep reference: [BACKEND_ARCHITECTURE.md](docs/BACKEND_ARCHITECTURE.md)
+- UI companion: [for_ui_developers.md](for_ui_developers.md)
