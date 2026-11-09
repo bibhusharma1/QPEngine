@@ -14,14 +14,15 @@ import zipfile
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Literal
+from urllib.parse import quote
 
 from fastapi import BackgroundTasks, Body, Depends, FastAPI, File, HTTPException, Request, UploadFile, Query
 from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import AliasChoices, BaseModel, Field, StrictInt, field_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, StrictInt, field_validator
 
 from config.settings import CORS_ORIGINS, JWT_SECRET, MAX_UPLOAD_BYTES, STORAGE_ROOT, DEFAULT_TEACHER_PASSWORD
 from config.outputs import stage_output_dir
@@ -57,17 +58,7 @@ logger = logging.getLogger(__name__)
 
 
 def _startup() -> None:
-    import os
-    # Ensure env vars are picked up
-    backend_env = os.environ.get("DATABASE_BACKEND") or getattr(app_settings, "DATABASE_BACKEND", "sqlite")
-    backend = str(backend_env).casefold()
-    if backend not in {"turso","sqlite"}:
-        raise RuntimeError("Unsupported DB backend")
-    if backend == "turso":
-        if not (os.environ.get("TURSO_DATABASE_URL") or getattr(app_settings, "TURSO_DATABASE_URL", "")):
-            raise RuntimeError("TURSO_DATABASE_URL is not set.")
-        if not (os.environ.get("TURSO_AUTH_TOKEN") or getattr(app_settings, "TURSO_AUTH_TOKEN", "")):
-            raise RuntimeError("TURSO_AUTH_TOKEN is not set.")
+    database.validate_configuration()
     if len(JWT_SECRET) < 32 or "replace" in JWT_SECRET.casefold():
         raise RuntimeError("Set QUES_JWT_SECRET to a private random value of at least 32 characters.")
     if getattr(app_settings, "APP_ENV", "").casefold() not in {"local", "render"}:
@@ -88,8 +79,8 @@ def _startup() -> None:
             now = __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat()
             db.execute("INSERT OR IGNORE INTO users(email,name,hashed_password,role,status,created_at) VALUES(?,?,?,?,?,?)",
                        ("admin@example.com","Administrator",h,"admin","active",now))
-            db.execute("INSERT OR IGNORE INTO admins(email,password_hash,access_mode) VALUES(?,?,?)",
-                       ("admin@example.com",h,"edit"))
+            db.execute("INSERT OR IGNORE INTO admins(email,password_hash) VALUES(?,?)",
+                       ("admin@example.com",h))
             db.commit()
         except Exception as e:
             print("seed err", e)
@@ -199,8 +190,20 @@ class TeacherCreate(BaseModel):
     email: str = Field(min_length=3, max_length=254)
     department: str | None = Field(default=None, max_length=64)
     password: str | None = Field(default=None, max_length=256)
-    status: str = "pending"
+    status: Literal["authorized", "unauthorized"] = "authorized"
     subjects: list[str] = Field(default_factory=list)
+
+
+class TeacherUpdate(BaseModel):
+    """Fields accepted when partially updating a teacher."""
+    model_config = ConfigDict(extra="forbid")
+
+    name: str | None = None
+    email: str | None = None
+    department: str | None = None
+    status: Literal["authorized", "unauthorized"] | None = None
+    password: str | None = None
+    subjects: list[str] | None = None
 
 
 class TeacherSubjectAssign(BaseModel):
@@ -448,6 +451,7 @@ def get_question_bank(user: Annotated[str, Depends(require_user)], subject_id: s
                 raise HTTPException(status_code=404, detail="Subject not found")
             continue
         require_subject_access(user, subject)
+        _enforce_subject_permission(user, subject, "manage_question_bank")
         for record in question_bank_service.read_subject(subject):
             record["subject_id"] = subject
             records.append(record)
@@ -634,7 +638,10 @@ def _priority_question_ids(subject_id: str | None, user: str) -> set[str]:
     elif allowed is None:
         subjects = list_subject_names()
     else:
-        subjects = sorted(allowed)
+        subjects = sorted(
+            name for name in allowed
+            if database.check_user_subject_permission(user, name, "manage_question_bank")
+        )
     ids: set[str] = set()
     for subject in subjects:
         validate_subject_name(subject)
@@ -1185,7 +1192,7 @@ def login(request: LoginRequest) -> dict:
             password_ok = bool(database._password_hash.verify(request.password, stored_hash))
         except Exception:
             password_ok = False
-    if status in {"pending", "disapproved"}:
+    if status in {"pending", "disapproved", "unauthorized"}:
         if password_ok:
             detail = "Account is pending approval" if status == "pending" else "Account access has been revoked"
             raise HTTPException(status_code=403, detail=detail)
@@ -1486,10 +1493,12 @@ def start_processing(subject: str, filename: str, background: BackgroundTasks,
 
 
 @app.get("/jobs/{job_id}", tags=["processing"])
-def get_job(job_id: str, _: Admin) -> dict:
+def get_job(job_id: str, user: Annotated[str, Depends(require_user)]) -> dict:
     job = database.get_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
+    require_subject_access(user, job["subject"])
+    _enforce_subject_permission(user, job["subject"], "view_papers")
     return _job_payload(job)
 
 
@@ -1502,6 +1511,34 @@ def get_pdf_status(user: Annotated[str, Depends(require_user)], subject: str, fi
         raise HTTPException(status_code=404, detail="Document not found in this subject.")
     job = database.latest_job(subject, safe_filename)
     return _job_payload(job) if job else {"subject": subject, "filename": safe_filename, "status": "not_processed"}
+
+
+@app.get("/subjects/{subject}/pdfs/{filename}/download", tags=["PDFs"])
+def download_source_pdf(subject: str, filename: str,
+                        user: Annotated[str, Depends(require_user)]) -> Response:
+    safe_filename = validate_document_filename(filename)
+    require_subject_access(user, subject)
+    _enforce_subject_permission(user, subject, "view_papers")
+    document = database.get_document(subject, safe_filename)
+    if not document:
+        raise HTTPException(status_code=404, detail="Document not found in this subject.")
+    content = database.get_document_bytes(subject, safe_filename)
+    if content is None:
+        raise HTTPException(status_code=404, detail="Document content is not available.")
+    content_type = document.get("content_type") or "application/octet-stream"
+    if "/" not in content_type:
+        content_type = {
+            "pdf": "application/pdf",
+            "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "png": "image/png",
+            "jpg": "image/jpeg",
+            "jpeg": "image/jpeg",
+        }.get(content_type.casefold(), "application/octet-stream")
+    return Response(
+        content=content,
+        media_type=content_type,
+        headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(safe_filename, safe='')}"},
+    )
 
 
 @app.get("/subjects/{subject}/pdfs/{filename}/result", tags=["processing"])
@@ -1613,7 +1650,6 @@ def _docx_has_word_entries(path: Path | bytes) -> bool:
 def current_user(email: Annotated[str, Depends(require_user)]) -> dict:
     row = _user_row(email)
     if row["role"] == "admin":
-        row["access_mode"] = database.get_admin_access_mode(email)
         row["subjects"] = list_subject_names()
     else:
         # Include both teacher assignments and user-subject assignments
@@ -1630,29 +1666,6 @@ def current_user(email: Annotated[str, Depends(require_user)]) -> dict:
         except Exception:
             row["subject_permissions"] = []
     return row
-
-
-@app.get("/auth/access-mode", tags=["authentication"])
-def get_access_mode(_: Admin) -> dict:
-    """The authenticated administrator's view/edit access mode (server-persisted)."""
-    return {"role": "admin", "access_mode": database.get_admin_access_mode(_)}
-
-
-@app.put("/auth/access-mode", tags=["authentication"])
-def update_access_mode(request: dict, _: Admin) -> dict:
-    """The authenticated administrator selects their own access mode.
-
-    The mode is stored against the administrator account server-side; client
-    tokens carry no role or permission claims. Switching modes is always
-    allowed for the authenticated administrator, including from readonly back
-    to edit.
-    """
-    mode = (request or {}).get("access_mode")
-    if mode not in {"readonly", "edit"}:
-        raise HTTPException(status_code=422, detail="access_mode must be 'readonly' or 'edit'")
-    if not database.set_admin_access_mode(email=_, mode=mode):
-        raise HTTPException(status_code=409, detail="Administrator account record not found")
-    return {"role": "admin", "access_mode": mode}
 
 
 # TOTP endpoints
@@ -1811,14 +1824,14 @@ def list_teachers_or_users(_: Admin, status: str | None = None, search: str | No
 def create_teacher(request: TeacherCreate, _: AdminWrite) -> dict:
     from src.masterdeorca.database import _password_hash
     email = request.email.strip().lower()
-    status = request.status
-    if status in {"authorized"}:
-        status = "approved"
-    elif status in {"unauthorized"}:
-        status = "disapproved"
-    if "@" not in email or status not in {"pending", "approved", "disapproved"}:
+    status = request.status or "authorized"
+    if status not in {"authorized", "unauthorized"}:
         raise HTTPException(status_code=422, detail="Invalid email or teacher status.")
-    subjects = _validated_subjects(request.subjects) if request.subjects else list_subject_names()
+    if "@" not in email:
+        raise HTTPException(status_code=422, detail="Invalid email or teacher status.")
+    # Teacher creation establishes an account only. Subject access is granted
+    # later through the explicit assignment endpoints.
+    subjects: list[str] = []
     if not (request.password or "").strip():
         password = DEFAULT_TEACHER_PASSWORD
         password_supplied = False
@@ -1839,14 +1852,10 @@ def create_teacher(request: TeacherCreate, _: AdminWrite) -> dict:
             cur = db.execute("INSERT INTO users(email,name,hashed_password,role,status,created_at) VALUES(?,?,?,?,?,?)",
                              (email, request.name.strip(), password_hash, "teacher", status, now))
             row = db.execute("SELECT id,name,email,department,status,hashed_password,created_at FROM users WHERE email=?", (email,)).fetchone()
-            if row is None or not database._password_hash.verify(password, row["hashed_password"]):
+            if row is None or row["hashed_password"] != password_hash:
                 logger.error("Teacher creation stored-hash verification failed: email=%s user_id=%s", email, (row["id"] if row else None))
                 raise HTTPException(status_code=500, detail="Password storage verification failed.")
             logger.info("Teacher creation stored-hash verified: email=%s user_id=%s", email, row["id"])
-            if subjects:
-                db.executemany("INSERT INTO teacher_subjects(teacher_id, subject_name, created_at) VALUES(?,?,?)",
-                               [(row["id"], name, now) for name in subjects])
-            database.assign_user_subjects(row["id"], subjects, {}) if subjects else None
     except HTTPException:
         raise
     except Exception as exc:
@@ -1856,9 +1865,10 @@ def create_teacher(request: TeacherCreate, _: AdminWrite) -> dict:
 
 
 @app.patch("/teachers/{teacher_id}", tags=["teachers"])
-def update_teacher(teacher_id: int, changes: dict, _: AdminWrite) -> dict:
+def update_teacher(teacher_id: int, changes: TeacherUpdate, _: AdminWrite) -> dict:
     from src.masterdeorca.database import _password_hash
     allowed = {"name", "email", "department", "status", "password", "subjects"}
+    changes = changes.model_dump(exclude_unset=True)
     if not changes or set(changes) - allowed:
         raise HTTPException(status_code=422, detail="Provide valid teacher fields to update.")
     vals = dict(changes)
@@ -1872,13 +1882,8 @@ def update_teacher(teacher_id: int, changes: dict, _: AdminWrite) -> dict:
     if "email" in vals:
         vals["email"] = str(vals["email"]).strip().lower()
         if "@" not in vals["email"]: raise HTTPException(status_code=422, detail="Invalid email.")
-    if "status" in vals:
-        if vals["status"] == "authorized":
-            vals["status"] = "approved"
-        elif vals["status"] == "unauthorized":
-            vals["status"] = "disapproved"
-        if vals["status"] not in {"pending", "approved", "disapproved"}:
-            raise HTTPException(status_code=422, detail="Invalid teacher status.")
+    if "status" in vals and vals["status"] is None:
+        raise HTTPException(status_code=422, detail="status must be 'authorized' or 'unauthorized'.")
     password_changed = False
     new_pw_for_verify = None
     if "password" in vals:
@@ -1923,10 +1928,9 @@ def update_teacher(teacher_id: int, changes: dict, _: AdminWrite) -> dict:
                                 stored_hash = None
                     if stored_hash is None or not database._password_hash.verify(new_pw_for_verify, stored_hash):
                         raise HTTPException(status_code=500, detail="Password update verification failed.")
-                try:
-                    db.commit()
-                except Exception:
-                    pass
+                # Do not return a successful status response unless the Turso
+                # transaction has actually committed.
+                db.commit()
             except HTTPException:
                 try:
                     db.rollback()
@@ -1940,7 +1944,9 @@ def update_teacher(teacher_id: int, changes: dict, _: AdminWrite) -> dict:
                     pass
                 if "UNIQUE" in str(exc): raise HTTPException(status_code=409, detail="Email already exists.") from exc
                 raise
-            row = db.execute("SELECT id,name,email,department,status,created_at FROM users WHERE id=?", (teacher_id,)).fetchone()
+            row = db.execute("SELECT id,name,email,department,status,created_at FROM users WHERE id=? AND role='teacher'", (teacher_id,)).fetchone()
+            if row is None:
+                raise HTTPException(status_code=404, detail="Teacher not found")
             return row
     row = database._retry_db(_do_update)
     if subjects is not None:
@@ -1960,6 +1966,25 @@ def remove_teacher(teacher_id: int, _: AdminWrite):
         db.execute("UPDATE papers SET created_by=NULL WHERE created_by=?", (teacher_id,))
         cur = db.execute("DELETE FROM users WHERE id=? AND role='teacher'", (teacher_id,))
         if not cur.rowcount: raise HTTPException(status_code=404, detail="Teacher not found")
+
+
+@app.get("/teachers/me/subjects", tags=["teachers"])
+def list_my_teacher_subjects(email: Annotated[str, Depends(require_user)]) -> dict:
+    """Return the authenticated teacher's assigned subjects, never a client-selected user's."""
+    user = database.get_user_by_email(email)
+    if not user or user.get("role") != "teacher":
+        raise HTTPException(status_code=403, detail="Teacher role required")
+    subjects = database.get_user_subjects(user["id"])
+    if not subjects:
+        # Preserve visibility of explicit legacy assignments while returning
+        # no subjects for teachers who have no assignment rows in either store.
+        subjects = [
+            {"subject_name": name, "can_view_papers": None,
+             "can_upload_process": None, "can_manage_question_bank": None,
+             "can_generate_papers": None}
+            for name in database.get_teacher_subjects(email)
+        ]
+    return {"teacher_id": user["id"], "subjects": subjects}
 
 
 @app.get("/teachers/{teacher_id}/subjects", tags=["teachers"])
@@ -2121,8 +2146,13 @@ def list_questions(user: Annotated[str, Depends(require_user)], subject: str | N
     allowed = accessible_subjects(user)
     if subject is not None:
         require_subject_access(user, subject)
+        _enforce_subject_permission(user, subject, "manage_question_bank")
         clauses.append("q.subject_name=?"); args.append(subject)
     elif allowed is not None:
+        allowed = {
+            name for name in allowed
+            if database.check_user_subject_permission(user, name, "manage_question_bank")
+        }
         if not allowed:
             return {"questions": [], "total": 0}
         placeholders = ",".join("?" for _ in allowed)
@@ -2139,8 +2169,10 @@ def list_questions(user: Annotated[str, Depends(require_user)], subject: str | N
 
 
 @app.post("/questions", status_code=201, tags=["questions"])
-def create_question(request: QuestionCreate, _: AdminWrite) -> dict:
+def create_question(request: QuestionCreate, user: Annotated[str, Depends(require_write_user)]) -> dict:
     data = request.model_dump(); _validate_question(data); now = _now()
+    require_subject_access(user, data["subject"])
+    _enforce_subject_permission(user, data["subject"], "manage_question_bank")
     with database.connect() as db:
         cur = db.execute("INSERT INTO questions(subject_name,topic_id,text,difficulty,type,marks,status,source,created_at,updated_at) VALUES(?,?,?,?,?,?,'pending','manual',?,?)",
                          (data["subject"], data["topic_id"], data["text"].strip(), data["difficulty"], data["type"], data["marks"], now, now))
@@ -2149,16 +2181,22 @@ def create_question(request: QuestionCreate, _: AdminWrite) -> dict:
 
 
 @app.patch("/questions/{question_id}", tags=["questions"])
-def update_question(question_id: int, changes: dict, _: AdminWrite) -> dict:
+def update_question(question_id: int, changes: dict,
+                    user: Annotated[str, Depends(require_write_user)]) -> dict:
     allowed = {"subject", "topic_id", "text", "difficulty", "type", "marks", "status"}
     if not changes or set(changes) - allowed: raise HTTPException(status_code=422, detail="Provide valid question fields to update.")
     with database.connect() as db:
         old = db.execute("SELECT * FROM questions WHERE id=?", (question_id,)).fetchone()
         if not old: raise HTTPException(status_code=404, detail="Question not found")
+        require_subject_access(user, old["subject_name"])
+        _enforce_subject_permission(user, old["subject_name"], "manage_question_bank")
         combined = {"subject": old["subject_name"], "topic_id": old["topic_id"], "text": old["text"], "difficulty": old["difficulty"], "type": old["type"], "marks": old["marks"], "status": old["status"]} | changes
         if not isinstance(combined["text"], str) or not 1 <= len(combined["text"].strip()) <= 2000 or not isinstance(combined["marks"], int) or not 1 <= combined["marks"] <= 100:
             raise HTTPException(status_code=422, detail="Invalid question text or marks.")
         _validate_question(combined)
+        if combined["subject"] != old["subject_name"]:
+            require_subject_access(user, combined["subject"])
+            _enforce_subject_permission(user, combined["subject"], "manage_question_bank")
         mapping = {"subject": "subject_name", "topic_id": "topic_id", "text": "text", "difficulty": "difficulty", "type": "type", "marks": "marks", "status": "status"}
         db.execute("UPDATE questions SET " + ",".join(f"{mapping[k]}=?" for k in changes) + ",updated_at=? WHERE id=?",
                    [*(combined[k] for k in changes), _now(), question_id])
@@ -2167,8 +2205,12 @@ def update_question(question_id: int, changes: dict, _: AdminWrite) -> dict:
 
 
 @app.delete("/questions/{question_id}", status_code=204, tags=["questions"])
-def delete_question(question_id: int, _: AdminWrite):
+def delete_question(question_id: int, user: Annotated[str, Depends(require_write_user)]):
     with database.connect() as db:
+        row = db.execute("SELECT subject_name FROM questions WHERE id=?", (question_id,)).fetchone()
+        if not row: raise HTTPException(status_code=404, detail="Question not found")
+        require_subject_access(user, row["subject_name"])
+        _enforce_subject_permission(user, row["subject_name"], "manage_question_bank")
         cur = db.execute("DELETE FROM questions WHERE id=?", (question_id,))
         if not cur.rowcount: raise HTTPException(status_code=404, detail="Question not found")
 
@@ -2178,15 +2220,19 @@ def list_topics(subject: str, user: Annotated[str, Depends(require_user)]) -> di
     subject = validate_subject_name(subject)
     if subject not in list_subject_names(): raise HTTPException(status_code=404, detail="Subject not found")
     require_subject_access(user, subject)
+    _enforce_subject_permission(user, subject, "manage_question_bank")
     with database.connect() as db:
         rows = db.execute("SELECT t.*,count(q.id) question_count FROM topics t LEFT JOIN questions q ON q.topic_id=t.id WHERE t.subject_name=? GROUP BY t.id ORDER BY t.unit,t.id", (subject,)).fetchall()
     return {"subject": subject, "topics": [dict(row) for row in rows]}
 
 
 @app.post("/subjects/{subject}/topics", status_code=201, tags=["topics"])
-def create_topic(subject: str, request: TopicCreate, _: AdminWrite) -> dict:
+def create_topic(subject: str, request: TopicCreate,
+                 user: Annotated[str, Depends(require_write_user)]) -> dict:
     subject = validate_subject_name(subject)
     if subject not in list_subject_names(): raise HTTPException(status_code=404, detail="Subject not found")
+    require_subject_access(user, subject)
+    _enforce_subject_permission(user, subject, "manage_question_bank")
     try:
         with database.connect() as db:
             cur = db.execute("INSERT INTO topics(subject_name,name,unit,description) VALUES(?,?,?,?)", (subject, request.name.strip(), request.unit, request.description))
@@ -2198,13 +2244,17 @@ def create_topic(subject: str, request: TopicCreate, _: AdminWrite) -> dict:
 
 
 @app.patch("/topics/{topic_id}", tags=["topics"])
-def update_topic(topic_id: int, changes: dict, _: AdminWrite) -> dict:
+def update_topic(topic_id: int, changes: dict,
+                 user: Annotated[str, Depends(require_write_user)]) -> dict:
     if not changes or set(changes) - {"name", "unit", "description"}: raise HTTPException(status_code=422, detail="Provide valid topic fields.")
     if "name" in changes and (not isinstance(changes["name"], str) or not 1 <= len(changes["name"].strip()) <= 120): raise HTTPException(status_code=422, detail="Invalid topic name.")
     if changes.get("unit") is not None and (not isinstance(changes["unit"], int) or changes["unit"] < 1): raise HTTPException(status_code=422, detail="Unit must be at least 1.")
     try:
         with database.connect() as db:
-            if not db.execute("SELECT id FROM topics WHERE id=?", (topic_id,)).fetchone(): raise HTTPException(status_code=404, detail="Topic not found")
+            current = db.execute("SELECT id,subject_name FROM topics WHERE id=?", (topic_id,)).fetchone()
+            if not current: raise HTTPException(status_code=404, detail="Topic not found")
+            require_subject_access(user, current["subject_name"])
+            _enforce_subject_permission(user, current["subject_name"], "manage_question_bank")
             db.execute("UPDATE topics SET " + ",".join(f"{key}=?" for key in changes) + " WHERE id=?", [*changes.values(), topic_id])
             row = db.execute("SELECT t.*, (SELECT count(*) FROM questions q WHERE q.topic_id=t.id) question_count FROM topics t WHERE id=?", (topic_id,)).fetchone()
     except Exception as exc:
@@ -2214,14 +2264,18 @@ def update_topic(topic_id: int, changes: dict, _: AdminWrite) -> dict:
 
 
 @app.delete("/topics/{topic_id}", status_code=204, tags=["topics"])
-def delete_topic(topic_id: int, _: AdminWrite):
+def delete_topic(topic_id: int, user: Annotated[str, Depends(require_write_user)]):
     with database.connect() as db:
+        topic = db.execute("SELECT subject_name FROM topics WHERE id=?", (topic_id,)).fetchone()
+        if not topic: raise HTTPException(status_code=404, detail="Topic not found")
+        require_subject_access(user, topic["subject_name"])
+        _enforce_subject_permission(user, topic["subject_name"], "manage_question_bank")
         cur = db.execute("DELETE FROM topics WHERE id=?", (topic_id,))
         if not cur.rowcount: raise HTTPException(status_code=404, detail="Topic not found")
 
 
 @app.post("/subjects/{subject}/pdfs/{filename}/questions/import", status_code=201, tags=["questions"])
-def import_pdf_questions(subject: str, filename: str, user: Annotated[str, Depends(require_admin_write)], request: dict | None = None) -> dict:
+def import_pdf_questions(subject: str, filename: str, user: Annotated[str, Depends(require_write_user)], request: dict | None = None) -> dict:
     filename = validate_document_filename(filename)
     require_subject_access(user, subject)
     _enforce_subject_permission(user, subject, "manage_question_bank")
@@ -2284,7 +2338,7 @@ def update_pdf_review(subject: str, filename: str, request: dict, user: Annotate
 
 
 @app.delete("/subjects/{subject}/pdfs/{filename}", status_code=204, tags=["PDFs"])
-def delete_pdf(subject: str, filename: str, user: Annotated[str, Depends(require_admin_write)]):
+def delete_pdf(subject: str, filename: str, user: Annotated[str, Depends(require_write_user)]):
     filename = validate_document_filename(filename)
     require_subject_access(user, subject)
     _enforce_subject_permission(user, subject, "upload_process")
@@ -2394,11 +2448,18 @@ def delete_subject(subject: str, _: AdminWrite):
 @app.get("/papers", tags=["papers"])
 def list_papers(email: Annotated[str, Depends(require_user)], subject: str | None = None,
                 page: int = Query(1,ge=1), page_size: int = Query(50,ge=1,le=200), created_by: str | None = None) -> dict:
-    user = _user_row(email); clauses,args=["1=1"],[]
+    clauses,args=["1=1"],[]
+    allowed = accessible_subjects(email)
     if subject:
         require_subject_access(email, subject)
         clauses.append("p.subject_name=?"); args.append(subject)
-    if user["role"] != "admin" or created_by == "me": clauses.append("u.email=?"); args.append(email)
+    elif allowed is not None:
+        if not allowed:
+            return {"papers": [], "total": 0}
+        placeholders = ",".join("?" for _ in allowed)
+        clauses.append(f"p.subject_name IN ({placeholders})"); args.extend(sorted(allowed))
+    if created_by == "me":
+        clauses.append("u.email=?"); args.append(email)
     where=" AND ".join(clauses)
     with database.connect() as db:
         total=db.execute("SELECT count(*) FROM papers p LEFT JOIN users u ON u.id=p.created_by WHERE "+where,args).fetchone()[0]

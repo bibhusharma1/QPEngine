@@ -1,15 +1,14 @@
 # MasterDeOrca Backend Architecture
 
-> **Current storage status:** The source has moved to one local SQLite database. This
-> notice supersedes older filesystem-storage descriptions that remain in historical
-> sections below. Treat the current source and the SQLite-only summary here as
-> authoritative.
+> **Current storage status:** Turso Cloud is the only runtime database. All
+> Uvicorn, Docker, and deployed instances must use the same authenticated Turso
+> URL and token; local SQLite is not a runtime option.
 
-## Current SQLite-only runtime
+## Current Turso-only runtime
 
-- One FastAPI application uses one SQLite database selected by `DATABASE_PATH`
-  (default `~/.local/share/masterdeorca/masterdeorca.sqlite`). SQLite is configured
-  for WAL, foreign keys, a 30-second busy timeout, and normal synchronous mode.
+- One FastAPI application uses the configured Turso/libSQL database. Startup
+  rejects non-Turso configuration, missing credentials, unavailable connectivity,
+  and failed schema migrations; it never creates or switches to a local DB.
 - Uploaded documents are stored as `documents.content_blob`; parser outputs,
   extraction caches, figures, tables and reconstruction DOCX assets are stored in
   `stored_artifacts` with checksums and metadata. Generated question-paper DOCX and
@@ -20,11 +19,11 @@
   FastAPI endpoints and does not receive database paths or BLOB internals.
 - Lite processing materializes document/cache files only inside a temporary
   per-operation directory when a library requires paths. Extraction artifacts are
-  persisted to SQLite; `questions_parsed.json` is persisted only after Pydantic
+  persisted to Turso; `questions_parsed.json` is persisted only after Pydantic
   validation. Reconciliation is deterministic and operates on the stored parser
   result; it does not call an LLM or re-run paid extraction.
 - The legacy Local parser remains in the source but is disabled in the active job
-  service. Turso and object-storage clients are not initialized.
+  service. Runtime database access uses only the configured Turso connection.
 - `scripts.migrate_data` can copy an existing SQLite database into a new
   destination, then import legacy subject data; `scripts.import_legacy_data`
   imports source documents and parser/output assets into BLOBs without deleting
@@ -85,8 +84,8 @@ flowchart TB
     end
 
     subgraph STORE["Storage"]
-        FS[(Filesystem: subjects, JSON banks, DOCX, figures)]
-        SQLITE[(SQLite: users, jobs, reviews, RBAC)]
+        FS[(Temporary workspaces and compatibility projections)]
+        TURSO[(Turso: all persistent records and BLOB artifacts)]
     end
 
     UI -->|HTTP JSON + Bearer| ROUTES
@@ -129,7 +128,7 @@ MasterDeOrca/
 │   └── ReconstructQues/   # questions_parsed.json -> DOCX renderer (used by BOTH modes)
 ├── src/masterdeorca/
 │   ├── app.py             # FastAPI app, ALL routes, request Pydantic models (1958 lines)
-│   ├── database.py        # SQLite schema + helpers (users, jobs, RBAC, TOTP, reconciliation_state)
+│   ├── database.py        # Turso connection + schema helpers (users, jobs, RBAC, TOTP, reconciliation_state)
 │   ├── migrations.py      # idempotent startup migrations
 │   ├── security.py        # JWT issue/verify, require_user/admin/write deps, subject RBAC
 │   ├── storage.py         # subject/document name + path validation, layout helpers
@@ -197,9 +196,8 @@ placeholders with no code; they are not part of any active flow.
 1. Validates `QUES_JWT_SECRET`: must be ≥32 characters and must not contain
    "replace" (case-insensitive); otherwise `RuntimeError` at boot.
 2. Creates `STORAGE_ROOT` if missing.
-3. `database.initialize()` — creates all SQLite tables idempotently, runs
-   `migrations.run_migrations()`, seeds/updates the administrator account from
-   `QUES_ADMIN_EMAIL` / `QUES_ADMIN_PASSWORD` (rows in both `admins` and `users`).
+3. `database.initialize()` — creates schema in Turso and runs
+   `migrations.run_migrations()` over that same configured connection.
 4. `database.mark_interrupted_jobs()` — any `queued`/`running` job rows are
    marked `failed` with `stage="interrupted"` and the message
    *"Worker stopped before completion. Start a fresh processing run."*
@@ -222,7 +220,9 @@ Key resolved settings:
 | `DEFAULT_SUBJECT` | `QUES_DEFAULT_SUBJECT` | `OperatingSys` |
 | `MAX_UPLOAD_BYTES` | `QUES_MAX_UPLOAD_MB` | `50` (MiB) |
 | `API_PORT` | `QUES_PORT` | `8000` |
-| `DATABASE_PATH` | `DATABASE_PATH` or `QUES_DATABASE_PATH` | `<STORAGE_ROOT>/masterdeorca.sqlite` |
+| `DATABASE_BACKEND` | `DATABASE_BACKEND` | `turso` (required) |
+| `TURSO_DATABASE_URL` | `TURSO_DATABASE_URL` | required; database `qp`, org `bibhusharma1` |
+| `TURSO_AUTH_TOKEN` | `TURSO_AUTH_TOKEN` | required |
 | `JWT_SECRET` / `JWT_TTL_MINUTES` | `QUES_JWT_SECRET` / `QUES_JWT_TTL_MINUTES` | `""` (must be set) / `480` |
 | `ADMIN_EMAIL` / `ADMIN_PASSWORD` | `QUES_ADMIN_EMAIL` / `QUES_ADMIN_PASSWORD` | `admin@example.com` / `admin123` |
 | `CORS_ORIGINS` | `QUES_CORS_ORIGINS` | `http://localhost:3000,http://127.0.0.1:3000,http://localhost:5173,http://127.0.0.1:5173` |
@@ -241,11 +241,11 @@ Current notes:
 
 - `NVIDIA_API_CONCURRENCY` is defined (default 2) but **has no consumer** —
   Lite processing is strictly sequential per document.
-- Docker Compose uses one backend container and mounts `/data` for the database.
-- `DATABASE_BACKEND` must be `sqlite`; other database backends fail at
-  connection/startup rather than falling back.
-- `STORAGE_BACKEND=local` is accepted as a compatibility alias, but active API
-  persistence remains SQLite BLOB storage.
+- Docker and host Uvicorn instances use the same configured Turso database.
+- `DATABASE_BACKEND` must be `turso`; any other value fails at startup and every
+  database connection path rejects it.
+- `STORAGE_BACKEND=sqlite` is a legacy name for Turso BLOB storage; it does not
+  select a local database.
 - Reconciliation defaults to 12 hours, supports 24 hours, and does not run
   immediately at startup.
 - `QUES_MIN_FREE_VRAM_MB` (default 1500) is read by the legacy GPU runtime
@@ -293,9 +293,9 @@ directory per subject. Subject names must match
 │   ├── output/Reconstruct/<stem>/   # questions_reconstructed.docx
 │   ├── manifests/processing_status.json
 │   ├── logs/<stem>.log
-│   ├── metadata/                    # masterdeorca.sqlite (default location), <stem>.processing.json, create_idempotency.json
-│   └── question_bank.json           # persistent subject Question Bank
-└── .masterdeorca/                   # shared application data
+│   ├── metadata/                    # compatibility output files only
+│   └── question_bank.json           # compatibility projection; Turso is canonical
+└── .masterdeorca/                   # legacy/local projections; Turso is canonical
     ├── question_paper_blueprints.json
     ├── question_priorities.json
     ├── basic_configurations.json
@@ -308,9 +308,11 @@ directory per subject. Subject names must match
 not plain `.pdf` (DOCX, PNG, …) or contain unsafe characters get an 8-char
 SHA-256 suffix (e.g. `paper-1a2b3c4d`), so stage folders never collide.
 
-### 4.2 SQLite (`DATABASE_PATH`)
+### 4.2 Turso Cloud (libSQL)
 
-Default location: `<STORAGE_ROOT>/<DEFAULT_SUBJECT>/metadata/masterdeorca.sqlite`.
+The authenticated URL and token are configured with `TURSO_DATABASE_URL` and
+`TURSO_AUTH_TOKEN`. All runtime services and migrations use
+`src.masterdeorca.database.connect()`; there is no local application database.
 Tables (all created idempotently at startup; `PRAGMA foreign_keys=ON`):
 
 | Table | Purpose |
@@ -1328,56 +1330,40 @@ Numbered walkthrough:
 
 ---
 
-## 20. Persistence inventory and local-first migration
+## 20. Persistence inventory
 
-The default data root is `~/.local/share/masterdeorca` (overridable with
-`QUES_STORAGE_ROOT`; Docker uses `/data`). The original tree is copied without
-deleting the source. `scripts/migrate_data.py` performs the non-destructive
-copy, and `scripts/validate_data.py` verifies file hashes, SQLite integrity and
-source-row preservation.
+`TURSO_DATABASE_URL` and `TURSO_AUTH_TOKEN` configure the shared Turso Cloud
+database (`qp`, organization `bibhusharma1`). `QUES_STORAGE_ROOT` is used only
+for temporary workspaces, compatibility projections, and explicit local exports.
 
 | Data | Location | Format |
 |---|---|---|
-| Users, admins, teacher↔subjects, topics, legacy questions, legacy papers, pdf_reviews, jobs, reconciliation state, TOTP state/challenges | SQLite file (`QUES_DATABASE_PATH`) | relational |
-| Question Bank records | SQLite `question_bank_records` | JSON record per row, indexed by subject/document/marks and ordered by position; this is the runtime source of truth |
-| Question Bank compatibility projection | `<subject>/question_bank.json` | JSON, locked + atomic; retained for existing tools and reconciliation |
-| Blueprints, priorities, basic configs, UI configs, paper history, drafts | `<STORAGE_ROOT>/.masterdeorca/*.json`, `generated_papers/` | JSON, locked + atomic |
-| Processing status per subject / per job | `manifests/processing_status.json`, `metadata/<stem>.processing.json` | JSON |
-| Uploaded documents | SQLite `documents` registry + `<subject>/source/` | `documents.subject_id` references a registered subject; `storage_key` retains the subject-relative file path |
-| Stage artifacts (local mode) | `<subject>/output/{Scrapper,Parser,Reconstruct}/<stem>/` | JSON + images |
-| Lite caches/checkpoints + figure crops | `<subject>/output/Parser/<stem>/` | JSON + PNG |
-| Logs | `<subject>/logs/<stem>.log` | text |
+| Users, teachers, permissions, subjects, legacy questions/papers, reviews, jobs, TOTP and reconciliation | Turso relational tables | shared application database |
+| Question Bank records | Turso `question_bank_records` | JSON per row, indexed and ordered; runtime source of truth |
+| Blueprints, priorities, basic configs, UI configs, drafts and generated papers | Turso tables and BLOB columns | canonical structured records and document bytes |
+| Processing status and manifests | Turso `processing_manifests`, `jobs`, `processing_logs` | runtime reads and writes use database records |
+| Uploaded documents and parser/generated artifacts | Turso `documents` and `stored_artifacts` BLOBs | local copies materialized only as needed for processing/download |
+| Temporary stage files | per-operation temporary directories; legacy CLI output paths | ephemeral work files, never an application database |
 | In-memory job dedupe, metrics cache, scheduler state | process RAM | — |
 
-### 20.1 Turso and object storage — **SCAFFOLD ONLY; NOT VERIFIED**
+### 20.1 Turso runtime storage
 
-The configuration switch, DB-API adapter, migration scaffolding and optional
-sync command exist, but Turso support is not verified. Do not claim or deploy
-Turso support until a real Turso connection, schema migration, parameterized
-CRUD and synchronization round-trip have succeeded. Selecting Turso never
-silently falls back to local SQLite.
-
-Versioned migrations create shared entity tables for subjects, documents,
-reviews, Question Bank records, priorities, blueprints, drafts, generated
-papers, settings and scheduler state. The import command is idempotent and
-keeps source files intact. Existing configuration and paper services still
-persist some metadata as JSON; they have not all been cut over to database
-canonical storage.
-
-`STORAGE_BACKEND=object` is reserved but not implemented. Startup fails rather
-than silently using local storage. PDFs, figures, parser artifacts, and DOCX
-outputs remain on the configured filesystem.
+Turso is the required runtime database. Versioned migrations and all application
+CRUD use the same authenticated connection. Local SQLite tools are for explicit
+offline import/backup workflows only and are not reachable from application
+services. Local temporary processing files and compatibility projections may
+exist, but runtime reads use Turso records and artifacts.
 
 ---
 
-## 21. Localhost development configuration (CURRENT)
+## 21. Localhost development configuration
 
 - Backend: `uvicorn src.masterdeorca.app:app --reload --host 0.0.0.0 --port 8000`
   or `python -m src.masterdeorca` (`QUES_PORT`). Docker: compose maps
   `${QUES_PORT:-8000}:8000`, container `PaperWise`, healthcheck hits
   `/health`.
-- Storage: host `~/.local/share/masterdeorca`; compose binds it to `/data`
-  (`QUES_STORAGE_ROOT=/data`). SQLite defaults inside the default subject's
+- Storage: `/data` (`QUES_STORAGE_ROOT=/data`) may hold temporary files and
+  compatibility projections; application persistence uses the shared Turso DB.
   `metadata/` folder.
 - Frontend origins: `http://localhost:3000`, `http://127.0.0.1:3000`,
   `http://localhost:5173`, `http://127.0.0.1:5173` (Vite/Next dev servers).
@@ -1404,7 +1390,7 @@ outputs remain on the configured filesystem.
 | PyMuPDF (`fitz`) | page rendering (both modes), native text (local) | CPU |
 | PaddleOCR/PaddlePaddle GPU | local-mode OCR only | optional `ocr-gpu` extra; fails closed without NVIDIA GPU |
 | LangChain providers (Gemini/Groq/Mistral/NVIDIA/Cerebras) | legacy local parser only | unused in Lite mode |
-| Turso/libSQL | — | Adapter and scripts are experimental; live connection/migrations/CRUD not verified (§20.1) |
+| Turso/libSQL | All persistent application records and BLOB artifacts | Required runtime store; startup migrations and CRUD use the authenticated configured connection (§20.1) |
 
 Python deps of record: FastAPI, uvicorn, python-multipart, python-dotenv,
 pydantic v2, PyMuPDF, Pillow, python-docx, langchain*, pwdlib[argon2], PyJWT,

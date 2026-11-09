@@ -28,7 +28,7 @@ def require_user(credentials: HTTPAuthorizationCredentials | None = Depends(bear
         email = str(subject).lower()
         with database.connect() as db:
             row = db.execute("SELECT status FROM users WHERE email=?", (email,)).fetchone()
-        if not row or row["status"] not in {"active", "approved"}:
+        if not row or row["status"] not in {"active", "approved", "authorized"}:
             raise HTTPException(status_code=401, detail="User account is not active", headers={"WWW-Authenticate": "Bearer"})
         return email
     except (jwt.InvalidTokenError, ValueError) as exc:
@@ -43,29 +43,13 @@ def require_admin(email: str = Depends(require_user)) -> str:
     return email
 
 
-def _administrator_mode(email: str) -> str:
-    with database.connect() as db:
-        row = db.execute("SELECT role FROM users WHERE email=?", (email,)).fetchone()
-        role = row["role"] if row else "teacher"
-    if role != "admin":
-        return "edit"  # Non-admin principals keep their established permissions.
-    return database.get_admin_access_mode(email)
-
-
-READONLY_DETAIL = "Administrator account is in read-only mode; editing is disabled"
-
-
 def require_write_user(email: str = Depends(require_user)) -> str:
-    """Gate record-mutating routes; administrators must not be in readonly mode."""
-    if _administrator_mode(email) == "readonly":
-        raise HTTPException(status_code=403, detail=READONLY_DETAIL)
+    """Gate record-mutating routes."""
     return email
 
 
 def require_admin_write(email: str = Depends(require_admin)) -> str:
-    """Gate administrative mutations; read-only administrators receive 403."""
-    if database.get_admin_access_mode(email) == "readonly":
-        raise HTTPException(status_code=403, detail=READONLY_DETAIL)
+    """Gate administrative mutations."""
     return email
 
 
@@ -81,8 +65,11 @@ def accessible_subjects(email: str) -> set[str] | None:
     Read from the database on every call so assignment changes take effect
     immediately, without re-login or token claims.
     """
-    if _user_role(email) != "teacher":
+    role = _user_role(email)
+    if role == "admin":
         return None
+    if role != "teacher":
+        return set()
     return set(database.get_teacher_subjects(email))
 
 

@@ -1221,10 +1221,13 @@ def _resolve_question_candidates(
             key=lambda block: block["reading_order"],
         )
         source_pages = sorted({block["page_number"] for block in all_blocks})
-        question_text = _question_content_from_blocks(question_blocks)
+        question_source_text = _question_content_from_blocks(question_blocks)
+        question_text, text_marks = _remove_question_metadata(question_source_text)
+        if not question.get("marks") and text_marks is not None:
+            question["marks"] = text_marks
         question_priority_text = _extract_priority_from_text(
             "\n".join([
-                question_text,
+                question_source_text,
                 *(block["text"] for block in instruction_blocks),
             ])
         )
@@ -1247,9 +1250,17 @@ def _resolve_question_candidates(
         )
 
         def finalize_child_priority(child: dict[str, Any]) -> None:
+            child_source_text = str(child.get("original_text") or child.get("text") or "")
+            child_text, child_marks = _remove_question_metadata(
+                child_source_text
+            )
+            child["text"] = child_text
+            child["original_text"] = child_text
+            if not child.get("marks") and child_marks is not None:
+                child["marks"] = child_marks
             child_text_priority = _extract_priority_from_text(
                 "\n".join([
-                    str(child.get("original_text") or child.get("text") or ""),
+                    child_source_text,
                     str(child.get("section_instructions") or ""),
                 ])
             )
@@ -1643,6 +1654,37 @@ def _extract_priority_from_text(text: object) -> int | None:
         if value in {1, 2, 3}:
             return value
     return None
+
+
+_QUESTION_METADATA_MARKS = re.compile(
+    r"(?i)(?<!\w)(?:\[\s*(\d+(?:\.\d+)?)\s*marks?\s*\]"
+    r"|\(\s*(\d+(?:\.\d+)?)\s*marks?\s*\)"
+    r"|\bmarks?\s*[:=]?\s*(\d+(?:\.\d+)?))"
+)
+_QUESTION_METADATA_PRIORITY = re.compile(
+    r"(?i)(?<!\w)priority\s*(?:(?:level|order)\s*)?[:=]?\s*[123]\b"
+)
+
+
+def _remove_question_metadata(text: str) -> tuple[str, str | None]:
+    """Remove only explicit marks/priority labels, returning extracted marks if present."""
+    marks: str | None = None
+
+    def remove_marks(match: re.Match[str]) -> str:
+        nonlocal marks
+        if marks is None:
+            marks = next((value for value in match.groups() if value is not None), None)
+        return " "
+
+    cleaned = _QUESTION_METADATA_MARKS.sub(remove_marks, text)
+    cleaned = _QUESTION_METADATA_PRIORITY.sub(" ", cleaned)
+    # Tidy separators left immediately around removed metadata while retaining
+    # sentence punctuation and all remaining wording.
+    cleaned = re.sub(r"\s+([,;])", r"\1", cleaned)
+    cleaned = re.sub(r"([,;])\s*([.!?])", r"\2", cleaned)
+    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+    cleaned = re.sub(r"\s+([.!?])", r"\1", cleaned)
+    return cleaned.strip(), marks
 
 
 def _normalize_marks(value: Any) -> tuple[float | None, str | None, list[str]]:

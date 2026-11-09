@@ -52,7 +52,7 @@
 - PyMuPDF (`fitz`) — page rendering (both modes).
 - PaddleOCR/PaddlePaddle GPU — local-mode OCR only (optional `ocr-gpu` extra).
 - LangChain providers (Gemini/Groq/Mistral/NVIDIA/Cerebras) — legacy local parser only.
-- Turso/libSQL — scaffold only, not verified.
+- Turso/libSQL — required runtime database for all persistent application data.
 
 ## Model references
 

@@ -442,6 +442,18 @@ def _migrate_subject_permission_backfill(db: sqlite3.Connection) -> None:
         pass
 
 
+def _migrate_teacher_status_values(db: sqlite3.Connection) -> None:
+    """Map legacy teacher statuses to authorized/unauthorized."""
+    try:
+        db.execute("UPDATE users SET status='authorized' WHERE role='teacher' AND status IN ('approved','active')")
+    except Exception:
+        pass
+    try:
+        db.execute("UPDATE users SET status='unauthorized' WHERE role='teacher' AND status IN ('pending','disapproved')")
+    except Exception:
+        pass
+
+
 MIGRATIONS: tuple[tuple[str, object], ...] = (
     ("teacher_subjects", _migrate_teacher_subjects),
     ("totp_pending_secret", _migrate_totp_pending_secret),
@@ -456,6 +468,7 @@ MIGRATIONS: tuple[tuple[str, object], ...] = (
     ("sqlite_blob_storage_v1", _migrate_sqlite_blob_storage),
     ("user_subject_permissions_v1", _migrate_user_subject_permissions),
     ("teacher_subjects_to_user_assignments_v1", _migrate_teacher_subjects_to_user_assignments),
+    ("teacher_status_values_v1", _migrate_teacher_status_values),
 )
 
 

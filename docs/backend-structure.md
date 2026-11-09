@@ -8,7 +8,7 @@ MasterDeOrca/
 ├── functions/             # legacy local-mode pipelines (Scrapper/Parser/Reconstruct)
 ├── src/masterdeorca/
 │   ├── app.py             # FastAPI app + all routes + Pydantic models
-│   ├── database.py        # SQLite schema + helpers
+│   ├── database.py        # authenticated Turso connection + schema helpers
 │   ├── migrations.py      # idempotent startup migrations
 │   ├── security.py        # JWT, RBAC, subject access
 │   ├── storage.py         # subject/document name + path validation
@@ -69,15 +69,16 @@ Single source of truth: `config/settings.py` (loads `.env` via python-dotenv,
 ├── output/Reconstruct/<stem>/ # questions_reconstructed.docx
 ├── manifests/processing_status.json
 ├── logs/<stem>.log
-├── metadata/               # sqlite db (default), processing summaries
-└── question_bank.json      # persistent subject bank
-<STORAGE_ROOT>/.masterdeorca/ # blueprints, priorities, configs, generated papers, drafts
+├── metadata/               # compatibility summaries/projections only
+└── question_bank.json      # compatibility projection; Turso is canonical
+<STORAGE_ROOT>/.masterdeorca/ # legacy/local projections; Turso is canonical
 ```
 
 ## Database
 
-SQLite at `DATABASE_PATH` (default `~/.local/share/masterdeorca/masterdeorca.sqlite`).
-Tables and operations: [database.md](database.md).
+Turso Cloud at `TURSO_DATABASE_URL` (the shared `qp` database in organization
+`bibhusharma1`). SQLite is not a runtime fallback. Tables and operations:
+[database.md](database.md).
 
 ## Related
 

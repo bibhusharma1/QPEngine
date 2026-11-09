@@ -4,11 +4,10 @@ from __future__ import annotations
 
 import json
 import hashlib
-import sqlite3
 import uuid
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from config import settings
 from config.settings import ADMIN_EMAIL, ADMIN_PASSWORD
@@ -18,8 +17,6 @@ from src.masterdeorca import migrations
 
 _password_hash = PasswordHash.recommended()
 _SUBJECT_ID_NAMESPACE = uuid.UUID("bf54f1f5-1d81-4c12-8d70-29b7a414a0e2")
-DATABASE_BACKEND = getattr(settings, "DATABASE_BACKEND", "turso")
-DATABASE_PATH = getattr(settings, "DATABASE_PATH", "/data/masterdeorca.sqlite")
 
 
 class _NormalizedRow(dict):
@@ -138,91 +135,71 @@ class _NormalizedConnection:
         return self._connection.close()
 
     def __enter__(self):
-        try:
-            self._connection.__enter__()
-        except Exception:
-            pass
+        enter = getattr(self._connection, "__enter__", None)
+        if enter is not None:
+            enter()
         return self
 
     def __exit__(self, *exc):
-        try:
-            return self._connection.__exit__(*exc)
-        except Exception:
-            return None
+        exit_context = getattr(self._connection, "__exit__", None)
+        if exit_context is not None:
+            return exit_context(*exc)
+        if exc and exc[0] is not None:
+            rollback = getattr(self._connection, "rollback", None)
+            if rollback is not None:
+                rollback()
+            return False
+        self._connection.commit()
+        return False
 
     def __getattr__(self, name):
         return getattr(self._connection, name)
 
 
+def validate_configuration() -> None:
+    backend = str(getattr(settings, "DATABASE_BACKEND", "")).casefold()
+    if backend != "turso":
+        raise RuntimeError(
+            "DATABASE_BACKEND must be 'turso'; local SQLite is not an application datastore."
+        )
+    url = str(getattr(settings, "TURSO_DATABASE_URL", "") or "")
+    if not url:
+        raise RuntimeError("TURSO_DATABASE_URL must be set to the configured Turso database.")
+    if not getattr(settings, "TURSO_AUTH_TOKEN", ""):
+        raise RuntimeError("TURSO_AUTH_TOKEN must be set for the configured Turso database.")
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").casefold()
+    if parsed.scheme.casefold() != "libsql" or not (
+        host.startswith("qp-bibhusharma1.") and host.endswith(".turso.io")
+    ):
+        raise RuntimeError(
+            "TURSO_DATABASE_URL must identify database 'qp' in organization 'bibhusharma1'."
+        )
+
+
 def _get_connection():
-    backend = getattr(settings, "DATABASE_BACKEND", "turso").casefold()
-    if backend == "turso":
-        url = getattr(settings, "TURSO_DATABASE_URL", "") or ""
-        token = getattr(settings, "TURSO_AUTH_TOKEN", "") or ""
-        if not url:
-            raise RuntimeError("TURSO_DATABASE_URL must be set for Turso backend")
+    validate_configuration()
+    url = settings.TURSO_DATABASE_URL
+    token = settings.TURSO_AUTH_TOKEN
+    try:
+        import libsql  # type: ignore
+    except Exception as exc:
+        raise RuntimeError("Turso libSQL client is unavailable; install the backend dependencies.") from exc
+    try:
+        raw = libsql.connect(url, auth_token=token)
+    except Exception as exc:
+        # Never include the URL or token in an error that could reach logs/API output.
+        raise RuntimeError(
+            f"Unable to connect to the configured Turso database ({type(exc).__name__}). "
+            "Check Turso URL, token, network access, and database availability."
+        ) from exc
+    conn = _NormalizedConnection(raw)
+    for pragma in ("PRAGMA busy_timeout=30000", "PRAGMA foreign_keys=ON"):
         try:
-            import libsql  # type: ignore
-        except Exception as e:
-            raise RuntimeError(f"libSQL client not available: {e}")
-        if token:
-            try:
-                raw = libsql.connect(url, auth_token=token)
-            except TypeError:
-                try:
-                    raw = libsql.connect(url, auth_token=token)
-                except Exception:
-                    raw = libsql.connect(url)
-            except Exception:
-                raw = libsql.connect(url)
-        else:
-            raw = libsql.connect(url)
-        conn = _NormalizedConnection(raw)
-        for pragma in ("PRAGMA busy_timeout=30000", "PRAGMA foreign_keys=ON"):
-            try:
-                conn.execute(pragma)
-            except Exception:
-                pass
-        return conn
-    # Fallback to local SQLite if explicitly needed (not for Render)
-    db_path = globals().get("DATABASE_PATH", settings.DATABASE_PATH)
-    Path(db_path).parent.mkdir(parents=True, exist_ok=True)
-    db = sqlite3.connect(db_path, timeout=30, isolation_level="DEFERRED")
-    db.row_factory = sqlite3.Row
-    db.execute("PRAGMA foreign_keys=ON")
-    db.execute("PRAGMA busy_timeout=30000")
-    db.execute("PRAGMA synchronous=NORMAL")
-    db.execute("PRAGMA temp_store=MEMORY")
-    return db
-    # Fallback to local SQLite if explicitly needed (not for Render)
-    db_path = globals().get("DATABASE_PATH", settings.DATABASE_PATH)
-    Path(db_path).parent.mkdir(parents=True, exist_ok=True)
-    db = sqlite3.connect(db_path, timeout=30, isolation_level="DEFERRED")
-    db.row_factory = sqlite3.Row
-    db.execute("PRAGMA foreign_keys=ON")
-    db.execute("PRAGMA busy_timeout=30000")
-    db.execute("PRAGMA synchronous=NORMAL")
-    db.execute("PRAGMA temp_store=MEMORY")
-    return db
-
-
-def _row_factory(cursor, row):
-    try:
-        import sqlite3
-        if hasattr(sqlite3, 'Row'):
-            return sqlite3.Row(cursor, row)
-    except Exception:
-        pass
-    # Fallback: dict-like access
-    try:
-        if cursor.description:
-            d = {}
-            for idx, col in enumerate(cursor.description):
-                d[col[0]] = row[idx]
-            return d
-    except Exception:
-        pass
-    return row
+            conn.execute(pragma)
+        except Exception:
+            pass
+    return conn
 
 
 def _is_busy_error(exc: Exception) -> bool:
@@ -246,66 +223,18 @@ def _retry_db(operation, attempts: int = 5, base_delay: float = 0.05):
 
 
 def connect():
-    backend = str(globals().get("DATABASE_BACKEND", settings.DATABASE_BACKEND)).casefold()
-    if backend == "turso":
-        db = _get_connection()
-        # Ensure foreign keys and a bounded busy timeout if supported.
-        for pragma in ("PRAGMA foreign_keys=ON", "PRAGMA busy_timeout=30000"):
-            try:
-                db.execute(pragma)
-            except Exception:
-                pass
-        return db
-    # sqlite fallback
-    db_path = globals().get("DATABASE_PATH", settings.DATABASE_PATH)
-    Path(db_path).parent.mkdir(parents=True, exist_ok=True)
-    db = sqlite3.connect(db_path, timeout=30, isolation_level="DEFERRED")
-    db.row_factory = sqlite3.Row
-    db.execute("PRAGMA foreign_keys=ON")
-    db.execute("PRAGMA busy_timeout=30000")
-    db.execute("PRAGMA synchronous=NORMAL")
-    db.execute("PRAGMA temp_store=MEMORY")
-    return db
+    return _get_connection()
 
 
 def initialize() -> None:
-    backend = str(globals().get("DATABASE_BACKEND", settings.DATABASE_BACKEND)).casefold()
-    if backend == "turso":
-        # Initialize Turso schema
-        db = _get_connection()
-        try:
-            try:
-                db.execute("PRAGMA foreign_keys=ON")
-            except Exception:
-                pass
-            _init_schema(db)
-            try:
-                from src.masterdeorca import migrations
-                migrations.run_migrations(db)
-            except Exception:
-                pass
-            try:
-                db.commit()
-            except Exception:
-                pass
-        finally:
-            try:
-                db.close()
-            except Exception:
-                pass
-        return
-    db_path = globals().get("DATABASE_PATH", settings.DATABASE_PATH)
-    Path(db_path).parent.mkdir(parents=True, exist_ok=True)
-    with sqlite3.connect(db_path, timeout=30) as pragma_db:
-        pragma_db.execute("PRAGMA journal_mode=WAL")
-        pragma_db.execute("PRAGMA synchronous=NORMAL")
-    with connect() as db:
+    validate_configuration()
+    db = _get_connection()
+    try:
         _init_schema(db)
-        try:
-            from src.masterdeorca import migrations
-            migrations.run_migrations(db)
-        except Exception:
-            pass
+        migrations.run_migrations(db)
+        db.commit()
+    finally:
+        db.close()
 
 
 def _init_schema(db) -> None:
@@ -408,7 +337,6 @@ def _init_schema(db) -> None:
             last_error TEXT, last_attempt_at TEXT, next_retry_at TEXT,
             updated_at TEXT NOT NULL, PRIMARY KEY(subject, filename, stage)
         )""")
-        migrations.run_migrations(db)
         # Authentication is performed exclusively against the Turso users table.
         # Do not seed or overwrite administrator credentials from environment
         # variables; the database is the single source of truth.
@@ -563,23 +491,6 @@ def get_artifact(document_id: str, artifact_key: str) -> dict[str, Any] | None:
     return result
 
 
-def get_admin_access_mode(email: str) -> str:
-    """Return the administrator's access mode ('edit' by default, always server-side)."""
-    with connect() as db:
-        try:
-            row = db.execute("SELECT access_mode FROM admins WHERE email=?", (email.lower(),)).fetchone()
-        except sqlite3.Error:
-            return "edit"
-    return row["access_mode"] if row and row["access_mode"] in {"readonly", "edit"} else "edit"
-
-
-def set_admin_access_mode(email: str, mode: str) -> bool:
-    """Persist the access mode for an administrator account; returns False when absent."""
-    with connect() as db:
-        cur = db.execute("UPDATE admins SET access_mode=? WHERE email=?", (mode, email.lower()))
-    return cur.rowcount > 0
-
-
 def mark_interrupted_jobs() -> None:
     """Make unfinished in-process jobs retryable after an API restart."""
     now = datetime.now(timezone.utc).isoformat()
@@ -656,7 +567,7 @@ def verify_user(email: str, password: str) -> bool:
         except Exception:
             row = None
     status = _row_get(row, "status")
-    if not row or status not in {"active", "approved"}:
+    if not row or status not in {"active", "approved", "authorized"}:
         try:
             _password_hash.verify(password, _password_hash.hash("invalid-login-padding"))
         except Exception:

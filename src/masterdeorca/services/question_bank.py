@@ -449,6 +449,109 @@ def read_subject(subject: str) -> list[dict]:
     return _load_bank_rows(subject)
 
 
+def cleanup_safety_records() -> dict[str, int]:
+    """Remove exact duplicate and unmarked bank rows without touching source data."""
+    with database.connect() as db:
+        rows = db.execute(
+            """SELECT question_id,subject_name,record_json,created_at,updated_at
+               FROM question_bank_records ORDER BY subject_name,created_at,question_id"""
+        ).fetchall()
+
+    snapshots: list[dict] = []
+    groups: dict[tuple[str, str], list[dict]] = {}
+    for row in rows:
+        try:
+            record = json.loads(row["record_json"])
+        except (TypeError, json.JSONDecodeError):
+            # A malformed record cannot be safely classified for deletion.
+            continue
+        if not isinstance(record, dict):
+            continue
+        text = _record_text(record)
+        normalized_text = re.sub(r"\s+", " ", text.strip()).casefold()
+        item = {
+            "question_id": str(row["question_id"]),
+            "subject_name": str(row["subject_name"]),
+            "record_json": row["record_json"],
+            "created_at": str(row["created_at"] or ""),
+            "updated_at": str(row["updated_at"] or ""),
+            "normalized_text": normalized_text,
+            "has_marks": normalize_marks(record.get("marks")) is not None,
+        }
+        snapshots.append(item)
+        if normalized_text:
+            groups.setdefault((item["subject_name"], normalized_text), []).append(item)
+
+    duplicate_deletes: list[tuple[dict, dict]] = []
+    for group in groups.values():
+        if len(group) < 2:
+            continue
+        # Prefer a complete record, then the earliest record, with a stable ID
+        # tie-breaker. The retained row and all of its references stay intact.
+        canonical = min(
+            group,
+            key=lambda item: (
+                not item["has_marks"], item["created_at"], item["question_id"]
+            ),
+        )
+        for duplicate in group:
+            if duplicate is canonical:
+                continue
+            duplicate_deletes.append((duplicate, canonical))
+
+    incomplete_deletes = [item for item in snapshots if not item["has_marks"]]
+    duplicates_removed = 0
+    incomplete_removed = 0
+    if not duplicate_deletes and not incomplete_deletes:
+        return {"duplicates_removed": 0, "incomplete_removed": 0}
+
+    with database.connect() as db:
+        db.execute("BEGIN IMMEDIATE")
+        for duplicate, canonical in duplicate_deletes:
+            cursor = db.execute(
+                """DELETE FROM question_bank_records
+                   WHERE question_id=? AND subject_name=? AND record_json=? AND updated_at=?
+                     AND EXISTS (
+                         SELECT 1 FROM question_bank_records
+                         WHERE question_id=? AND subject_name=? AND record_json=? AND updated_at=?
+                     )""",
+                (
+                    duplicate["question_id"], duplicate["subject_name"],
+                    duplicate["record_json"], duplicate["updated_at"],
+                    canonical["question_id"], canonical["subject_name"],
+                    canonical["record_json"], canonical["updated_at"],
+                ),
+            )
+            if cursor.rowcount == 1:
+                db.execute(
+                    "DELETE FROM question_priorities WHERE question_id=?",
+                    (duplicate["question_id"],),
+                )
+                duplicates_removed += 1
+                if not duplicate["has_marks"]:
+                    incomplete_removed += 1
+        for item in incomplete_deletes:
+            cursor = db.execute(
+                """DELETE FROM question_bank_records
+                   WHERE question_id=? AND subject_name=? AND record_json=? AND updated_at=?""",
+                (
+                    item["question_id"], item["subject_name"],
+                    item["record_json"], item["updated_at"],
+                ),
+            )
+            if cursor.rowcount == 1:
+                db.execute(
+                    "DELETE FROM question_priorities WHERE question_id=?",
+                    (item["question_id"],),
+                )
+                incomplete_removed += 1
+
+    return {
+        "duplicates_removed": duplicates_removed,
+        "incomplete_removed": incomplete_removed,
+    }
+
+
 def _find_row(subject: str, question_id: str) -> dict:
     for row in _load_bank_rows(subject):
         if str(row.get("question_id")) == str(question_id):

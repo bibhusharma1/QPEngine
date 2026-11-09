@@ -5,7 +5,7 @@ validated, editable Question Bank and generates question-paper DOCX files from t
 
 ## Technologies
 
-Python 3.11+, FastAPI, uvicorn, SQLite, PyMuPDF, python-docx, Pydantic v2, pwdlib (Argon2),
+Python 3.11+, FastAPI, uvicorn, Turso/libSQL, PyMuPDF, python-docx, Pydantic v2, pwdlib (Argon2),
 PyJWT, pyotp, cryptography, httpx. Optional: LibreOffice (DOCX rasterization), PaddleOCR GPU
 (local mode).
 
@@ -14,8 +14,8 @@ PyJWT, pyotp, cryptography, httpx. Optional: LibreOffice (DOCX rasterization), P
 Single FastAPI process hosts routes, background jobs, and a reconciliation worker thread.
 Document intelligence runs in two modes selected by `PARSER_MODE`: `llm` (active NVIDIA Lite
 two-stage parser: Nemotron 3.5 Parse + Nemotron Super VL + deterministic assembly) and `local`
-(legacy PyMuPDF/GPU-OCR/LangGraph pipeline). Persistent Question Banks are per-subject JSON
-files; administration, jobs, RBAC and TOTP state live in SQLite.
+(legacy PyMuPDF/GPU-OCR/LangGraph pipeline). Turso Cloud is the single source of truth for
+Question Banks, administration, jobs, RBAC, TOTP state, documents and stored artifacts.
 
 See [docs/architecture.md](docs/architecture.md).
 
@@ -44,7 +44,6 @@ Optional extras:
 
 ```bash
 uv sync --extra ocr-gpu     # local GPU OCR (Linux, Python <3.12)
-uv sync --extra turso       # Turso scaffold deps (unverified)
 ```
 
 ### 2b. With pip
@@ -63,7 +62,6 @@ python -m pip install -e ".[dev]"
 
 # Optional extras:
 python -m pip install -e ".[ocr-gpu]"   # local GPU OCR (Linux, Python <3.12)
-python -m pip install -e ".[turso]"     # Turso scaffold deps (unverified)
 
 # Run backend
 uvicorn src.masterdeorca.app:app --reload --host 0.0.0.0 --port 8000

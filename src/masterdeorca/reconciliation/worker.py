@@ -30,12 +30,14 @@ RETRY_BOUNDS = {"parse": 3, "sync": 5}
 BACKOFF_START_SECONDS = 120
 BACKOFF_MAX_SECONDS = 900
 DEFAULT_INTERVAL_HOURS = 12
+QUESTION_BANK_CLEANUP_INTERVAL_SECONDS = 5 * 60
 LEASE_SECONDS = 600
 LEASE_HEARTBEAT_SECONDS = 120
 SCHEDULER_STATE_KEY = "reconciliation"
 
 run_lock = threading.Lock()
 _run_lock = run_lock
+_cleanup_lock = threading.Lock()
 _scheduler: "_Scheduler | None" = None
 _last_run: dict = {}
 
@@ -595,6 +597,48 @@ def reconcile_all(force: bool = False) -> dict:
         run_lock.release()
 
 
+def cleanup_question_bank_safety() -> dict:
+    """Clean unsafe Question Bank rows under the shared cross-instance lease."""
+    if not _cleanup_lock.acquire(blocking=False):
+        return {"skipped": True, "reason": "another safety cleanup is active in this process"}
+    owner = uuid.uuid4().hex
+    acquired_database_lease = False
+    lease_stop = threading.Event()
+    lease_thread: threading.Thread | None = None
+    try:
+        _read_scheduler_state()
+        acquired_database_lease = _acquire_database_lease(owner)
+        if not acquired_database_lease:
+            return {"skipped": True, "reason": "another maintenance run is active in another instance"}
+
+        def renew_lease() -> None:
+            while not lease_stop.wait(LEASE_HEARTBEAT_SECONDS):
+                try:
+                    _renew_database_lease(owner)
+                except Exception:
+                    logger.exception("Question Bank cleanup lease renewal failed")
+
+        lease_thread = threading.Thread(
+            target=renew_lease,
+            name="question-bank-cleanup-lease-renewal",
+            daemon=True,
+        )
+        lease_thread.start()
+        counts = question_bank.cleanup_safety_records()
+        logger.info(
+            "Question Bank safety cleanup removed %d duplicate rows and %d rows without valid marks (counts may overlap)",
+            counts["duplicates_removed"], counts["incomplete_removed"],
+        )
+        return counts
+    finally:
+        lease_stop.set()
+        if lease_thread is not None:
+            lease_thread.join(timeout=2)
+        if acquired_database_lease:
+            _release_database_lease(owner)
+        _cleanup_lock.release()
+
+
 def status() -> dict:
     """Persistent worker settings, last-run summary and pending retry states."""
     pending: list[dict] = []
@@ -627,19 +671,34 @@ def status() -> dict:
 
 
 class _Scheduler:
-    """Single-flight background scheduler hosting the reconciliation worker."""
+    """Single-flight scheduler for reconciliation and Question Bank safety."""
 
     def __init__(self) -> None:
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._loop, name="reconciliation-scheduler", daemon=True)
 
     def _loop(self) -> None:
-        while not self._stop.wait(_interval_seconds()):
-            try:
-                if _read_scheduler_state().get("enabled", True):
-                    reconcile_all()
-            except Exception:
-                logger.exception("Scheduled reconciliation pass failed")
+        next_cleanup = time.monotonic() + QUESTION_BANK_CLEANUP_INTERVAL_SECONDS
+        next_reconciliation = time.monotonic() + _interval_seconds()
+        while not self._stop.is_set():
+            now = time.monotonic()
+            wait_for = max(0.0, min(next_cleanup, next_reconciliation) - now)
+            if self._stop.wait(wait_for):
+                break
+            now = time.monotonic()
+            if now >= next_cleanup:
+                try:
+                    cleanup_question_bank_safety()
+                except Exception:
+                    logger.exception("Scheduled Question Bank safety cleanup failed")
+                next_cleanup = time.monotonic() + QUESTION_BANK_CLEANUP_INTERVAL_SECONDS
+            if now >= next_reconciliation:
+                try:
+                    if _read_scheduler_state().get("enabled", True):
+                        reconcile_all()
+                except Exception:
+                    logger.exception("Scheduled reconciliation pass failed")
+                next_reconciliation = time.monotonic() + _interval_seconds()
 
     def stop(self) -> None:
         self._stop.set()

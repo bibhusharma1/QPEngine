@@ -28,7 +28,7 @@ DEFAULT_SUBJECT = setting("QUES_DEFAULT_SUBJECT", "OperatingSys")
 MAX_UPLOAD_BYTES = int(setting("QUES_MAX_UPLOAD_MB", "50")) * 1024 * 1024
 API_PORT = int(setting("QUES_PORT", "8000"))
 DATABASE_BACKEND = setting("DATABASE_BACKEND", "turso").casefold()
-# For Turso, we use connection URL/token; DATABASE_PATH not used
+# Used only by explicit offline legacy-database tools; runtime services never read it.
 DATABASE_PATH = resolve_path(setting("DATABASE_PATH", "/data/masterdeorca.sqlite"))
 _storage_backend = setting("STORAGE_BACKEND", "sqlite").casefold()
 STORAGE_BACKEND = "sqlite" if _storage_backend == "local" else _storage_backend

@@ -26,8 +26,8 @@ The Lite image includes LibreOffice Writer for DOCX rasterization; PDF pages ras
 ## Environment configuration (no secrets here)
 
 Key settings (see `.env.example` for full list):
-- `APP_ENV` = `local` or `render`; `DATABASE_BACKEND=sqlite`; `STORAGE_BACKEND=sqlite` (or `local` alias).
-- `DATABASE_PATH` (preferred) or `QUES_DATABASE_PATH`; default `~/.local/share/masterdeorca/masterdeorca.sqlite`.
+- `APP_ENV` = `local` or `render`; `DATABASE_BACKEND=turso` (required); `STORAGE_BACKEND=sqlite` selects the existing Turso BLOB storage mode and does not select a local database.
+- `TURSO_DATABASE_URL` and `TURSO_AUTH_TOKEN` are required. All instances must use the same Turso database (`qp`, organization `bibhusharma1`).
 - `QUES_STORAGE_ROOT` (legacy import/CLI compat); `QUES_DEFAULT_SUBJECT=OperatingSys`; `QUES_MAX_UPLOAD_MB=50`; `QUES_PORT=8000`.
 - `QUES_JWT_SECRET` (≥32 chars), `QUES_JWT_TTL_MINUTES`; `QUES_ADMIN_EMAIL`, `QUES_ADMIN_PASSWORD`; `QUES_CORS_ORIGINS`.
 - `QUES_TOTP_ENCRYPTION_KEY`, `QUES_TOTP_ISSUER`, `QUES_TOTP_CHALLENGE_TTL_MINUTES`, `QUES_TOTP_FAILED_ATTEMPT_THRESHOLD`, `QUES_TOTP_COOLDOWN_SECONDS`.
@@ -37,34 +37,24 @@ Key settings (see `.env.example` for full list):
 ## Migration and recovery
 
 ```bash
-python -m scripts.migrate_data --storage-root /path/to/legacy-data \
-  --database "$DATABASE_PATH" --source-database /path/to/legacy/masterdeorca.sqlite
-python -m scripts.validate_data --database "$DATABASE_PATH" --storage-root /path/to/legacy-data
-python -m scripts.backup_data
-python -m scripts.restore_backup /path/to/backup/database/masterdeorca.sqlite --database "$DATABASE_PATH"
+python -m scripts.import_legacy_data --root /path/to/legacy-data
 ```
 
-Omit `--source-database` when no separate legacy SQLite DB. Source files remain untouched; import is idempotent. `restore_backup` refuses to replace an existing DB unless `--replace`. Stop backend before restoring.
+This explicit import utility reads legacy files and writes records/artifacts to
+the configured Turso connection. The old SQLite file backup/restore tools are
+for offline legacy archives only; they do not back up or configure the runtime
+database. Do not point application instances at local SQLite.
 
-`scripts.sync_sqlite_to_turso` is an unverified future-integration scaffold; not invoked by the app.
+## Render or Docker deployment
 
-## Turso / object storage
-
-Scaffold only, not verified. `DATABASE_BACKEND` must be `sqlite`; selecting Turso fails at startup rather than falling back. `STORAGE_BACKEND=object` reserved but not implemented.
-
-## Render deployment
-
-SQLite-only (SQLite is the only verified runtime backend; Turso is scaffold-only).
-Attach a persistent disk at `/data` and set env vars: `APP_ENV=local`, `DATABASE_BACKEND=sqlite`,
-`STORAGE_BACKEND=sqlite`, `DATABASE_PATH=/data/masterdeorca.sqlite`, `QUES_STORAGE_ROOT=/data`,
+Set `DATABASE_BACKEND=turso`, `TURSO_DATABASE_URL`, and `TURSO_AUTH_TOKEN` to
+the shared `qp` database in organization `bibhusharma1`. No persistent local
+database disk or `DATABASE_PATH` is required. Set `STORAGE_BACKEND=sqlite`, `QUES_STORAGE_ROOT=/data`,
 `QUES_JWT_SECRET` (≥32 chars), `QUES_ADMIN_EMAIL`, `QUES_ADMIN_PASSWORD`, `PORT=8000`,
 `PARSER_MODE=llm` (recommended on Render, no GPU), `CORS_ORIGINS` (comma-separated frontend
-origins), `QUES_RECONCILE_ENABLED=true`. Render uses the root `Dockerfile` (Lite mode by
-default); set NVIDIA API credentials via env. `PARSER_MODE=local` is not recommended on Render
-(no GPU).
-
-Turso deploy variant exists as an unverified scaffold (`scripts/init_turso_schema.py`,
-`scripts/sync_sqlite_to_turso.py`); do not treat as supported.
+origins), and `QUES_RECONCILE_ENABLED=true`. The root `Dockerfile` runs the Lite
+backend; set NVIDIA API credentials via environment. All runtime database reads,
+writes, and startup migrations use the configured authenticated Turso connection.
 
 ## Related
 
