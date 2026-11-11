@@ -9,7 +9,9 @@ RUN apt-get update \
 ENV UV_PROJECT_ENVIRONMENT=/app/.venv \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
-    PARSER_MODE=llm
+    PARSER_MODE=llm \
+    HOME=/tmp \
+    PATH="/app/.venv/bin:$PATH"
 
 COPY pyproject.toml uv.lock README.md ./
 RUN uv sync --frozen --no-dev

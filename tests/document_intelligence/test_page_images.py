@@ -9,6 +9,8 @@ from src.masterdeorca.document_intelligence.page_images import (
     PageImage,
     is_blank_image,
     render_page_images,
+    is_soffice_available,
+    get_soffice_executable,
 )
 
 
@@ -86,9 +88,27 @@ def test_render_missing_file_raises(tmp_path):
         list(render_page_images(tmp_path / "nope.pdf"))
 
 
+def test_is_soffice_available_matches_binary():
+    executable = get_soffice_executable()
+    assert is_soffice_available() == (executable is not None)
+
+
+def test_render_docx_missing_soffice_raises(tmp_path, monkeypatch):
+    import docx
+    from src.masterdeorca.document_intelligence import page_images
+
+    monkeypatch.setattr(page_images, "get_soffice_executable", lambda: None)
+    docx_path = tmp_path / "test.docx"
+    d = docx.Document()
+    d.add_paragraph("Sample")
+    d.save(str(docx_path))
+
+    with pytest.raises(RuntimeError, match="DOCX rendering in Lite mode requires LibreOffice"):
+        list(render_page_images(docx_path))
+
+
 @pytest.mark.skipif(
-    __import__("shutil").which("soffice") is None
-    and __import__("shutil").which("libreoffice") is None,
+    not is_soffice_available(),
     reason="LibreOffice not installed",
 )
 def test_render_docx_pages(tmp_path):

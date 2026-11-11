@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import io
 import logging
+import os
 import shutil
 import subprocess
 import tempfile
@@ -64,8 +65,18 @@ def _render_pdf_pages(pdf_path: Path, dpi: int) -> Iterator[PageImage]:
         doc.close()
 
 
+def get_soffice_executable() -> str | None:
+    """Return the path to the soffice or libreoffice binary if available on PATH."""
+    return shutil.which("soffice") or shutil.which("libreoffice")
+
+
+def is_soffice_available() -> bool:
+    """Check whether LibreOffice (soffice) is installed and available on PATH."""
+    return get_soffice_executable() is not None
+
+
 def _docx_to_pdf(docx_path: Path, out_dir: Path) -> Path:
-    soffice = shutil.which("soffice") or shutil.which("libreoffice")
+    soffice = get_soffice_executable()
     if not soffice:
         raise RuntimeError(
             "DOCX rendering in Lite mode requires LibreOffice (soffice) on PATH. "
@@ -73,12 +84,34 @@ def _docx_to_pdf(docx_path: Path, out_dir: Path) -> Path:
         )
     out_dir.mkdir(parents=True, exist_ok=True)
     before = {p.name for p in out_dir.iterdir()} if out_dir.is_dir() else set()
-    result = subprocess.run(
-        [soffice, "--headless", "--convert-to", "pdf", "--outdir", str(out_dir), str(docx_path)],
-        capture_output=True,
-        text=True,
-        timeout=300,
-    )
+
+    # Use a per-job temporary user profile directory and environment so LibreOffice
+    # runs reliably for non-root application users and avoids lock collisions
+    # across concurrent worker jobs.
+    with tempfile.TemporaryDirectory(prefix="soffice-profile-") as profile_dir:
+        profile_url = Path(profile_dir).as_uri()
+        env = os.environ.copy()
+        env["HOME"] = profile_dir
+        env["XDG_CACHE_HOME"] = profile_dir
+        env["XDG_CONFIG_HOME"] = profile_dir
+        result = subprocess.run(
+            [
+                soffice,
+                "--headless",
+                "--invisible",
+                "--nodefault",
+                "--norestore",
+                "--nologo",
+                f"-env:UserInstallation={profile_url}",
+                "--convert-to", "pdf",
+                "--outdir", str(out_dir),
+                str(docx_path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=300,
+            env=env,
+        )
     if result.returncode != 0:
         raise RuntimeError(
             "LibreOffice DOCX->PDF conversion failed: "

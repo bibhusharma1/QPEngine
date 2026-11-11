@@ -51,14 +51,26 @@ from src.masterdeorca.functions.totp import (
     service as totp_service, schemas as totp_schemas, exceptions as totp_exceptions,
     crypto as totp_crypto,
 )
+from src.masterdeorca.document_intelligence.page_images import is_soffice_available
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 logger = logging.getLogger(__name__)
 
 
+def _check_system_dependencies() -> None:
+    if is_soffice_available():
+        logger.info("LibreOffice (soffice) detected on PATH: DOCX rendering in Lite mode is available.")
+    else:
+        logger.warning(
+            "LibreOffice (soffice) not found on PATH. DOCX rendering in Lite mode will be unavailable "
+            "(install libreoffice-writer to enable DOCX page-image conversion). PDF and image processing remain available."
+        )
+
+
 def _startup() -> None:
     database.validate_configuration()
+    _check_system_dependencies()
     if len(JWT_SECRET) < 32 or "replace" in JWT_SECRET.casefold():
         raise RuntimeError("Set QUES_JWT_SECRET to a private random value of at least 32 characters.")
     if getattr(app_settings, "APP_ENV", "").casefold() not in {"local", "render"}:
@@ -1428,6 +1440,14 @@ def start_processing(subject: str, filename: str, background: BackgroundTasks,
     # Pre-flight format dispatch: native-text PDFs and DOCX never need Paddle;
     # scanned PDFs and standalone images are OCR-only inputs.
     suffix = Path(safe_filename).suffix.lower()
+    if suffix == ".docx" and not is_soffice_available():
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "DOCX rendering in Lite mode requires LibreOffice (soffice) on PATH. "
+                "Install libreoffice-writer to enable DOCX page-image conversion."
+            ),
+        )
     if suffix == ".pdf" and app_settings.PARSER_MODE != "llm":
         try:
             content = database.get_document_bytes(subject, safe_filename)
