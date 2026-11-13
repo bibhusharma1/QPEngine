@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import sqlite3
 import uuid
+import json
 from datetime import datetime, timezone
 
 
@@ -448,10 +449,205 @@ def _migrate_teacher_status_values(db: sqlite3.Connection) -> None:
         db.execute("UPDATE users SET status='authorized' WHERE role='teacher' AND status IN ('approved','active')")
     except Exception:
         pass
+
+
+def _migrate_smart_qpg(db) -> None:
+    """Syllabus versions and restart-safe AI question generation state."""
+    db.execute("""CREATE TABLE IF NOT EXISTS syllabi (
+        syllabus_id TEXT PRIMARY KEY,
+        subject_id TEXT NOT NULL REFERENCES subjects(subject_id) ON DELETE CASCADE,
+        document_id TEXT NOT NULL REFERENCES documents(document_id) ON DELETE CASCADE,
+        original_filename TEXT NOT NULL,
+        syllabus_name TEXT,
+        academic_year TEXT,
+        status TEXT NOT NULL DEFAULT 'pending',
+        processing_error TEXT,
+        version INTEGER NOT NULL,
+        is_active INTEGER NOT NULL DEFAULT 1,
+        summary_json TEXT NOT NULL,
+        summary_text TEXT NOT NULL,
+        created_by TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE(subject_id,version)
+    )""")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_syllabi_subject_active ON syllabi(subject_id,is_active)")
+    db.execute("""CREATE TABLE IF NOT EXISTS question_generation_jobs (
+        job_id TEXT PRIMARY KEY,
+        created_by TEXT NOT NULL,
+        subject_id TEXT NOT NULL REFERENCES subjects(subject_id),
+        syllabus_id TEXT NOT NULL REFERENCES syllabi(syllabus_id),
+        status TEXT NOT NULL,
+        request_json TEXT NOT NULL,
+        progress_json TEXT NOT NULL DEFAULT '{}',
+        error TEXT,
+        docx_blob BLOB,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )""")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_generation_jobs_owner ON question_generation_jobs(created_by,created_at)")
+    db.execute("""CREATE TABLE IF NOT EXISTS question_generation_items (
+        item_id TEXT PRIMARY KEY,
+        job_id TEXT NOT NULL REFERENCES question_generation_jobs(job_id) ON DELETE CASCADE,
+        section TEXT NOT NULL,
+        topic TEXT NOT NULL,
+        marks INTEGER NOT NULL,
+        type TEXT NOT NULL,
+        difficulty TEXT NOT NULL,
+        source_module TEXT NOT NULL DEFAULT '',
+        source_heading TEXT NOT NULL DEFAULT '',
+        position INTEGER NOT NULL DEFAULT 0,
+        status TEXT NOT NULL,
+        question_json TEXT,
+        error TEXT,
+        retries INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )""")
+    add_column_if_missing(db, "question_generation_items", "position", "INTEGER NOT NULL DEFAULT 0")
+    add_column_if_missing(db, "question_generation_items", "source_module", "TEXT NOT NULL DEFAULT ''")
+    add_column_if_missing(db, "question_generation_items", "source_heading", "TEXT NOT NULL DEFAULT ''")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_generation_items_job_status ON question_generation_items(job_id,status)")
     try:
         db.execute("UPDATE users SET status='unauthorized' WHERE role='teacher' AND status IN ('pending','disapproved')")
     except Exception:
         pass
+
+
+def _migrate_syllabus_upload_status(db) -> None:
+    """Track syllabus labels and background PDF processing state."""
+    add_column_if_missing(db, "syllabi", "syllabus_name", "TEXT")
+    add_column_if_missing(db, "syllabi", "academic_year", "TEXT")
+    add_column_if_missing(db, "syllabi", "status", "TEXT NOT NULL DEFAULT 'pending'")
+    add_column_if_missing(db, "syllabi", "processing_error", "TEXT")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_syllabi_subject_status ON syllabi(subject_id,status,created_at)")
+    db.execute("UPDATE syllabi SET status='completed' WHERE status='pending' AND summary_json NOT IN ('{}','')")
+    db.execute("UPDATE syllabi SET syllabus_name=original_filename WHERE syllabus_name IS NULL")
+
+
+def _summary_to_text(value: str | None) -> str:
+    """Render a legacy structured summary as readable syllabus text."""
+    try:
+        data = json.loads(value or "{}")
+    except (TypeError, ValueError):
+        return ""
+    parts = []
+    if data.get("overview"):
+        parts.append(str(data["overview"]).strip())
+    def render(label: str, entries) -> None:
+        if not isinstance(entries, list) or not entries:
+            return
+        lines = [label]
+        for entry in entries:
+            if isinstance(entry, str):
+                lines.append(f"- {entry.strip()}")
+            elif isinstance(entry, dict):
+                title = entry.get("unit") or entry.get("chapter") or entry.get("name") or entry.get("topic") or entry.get("title")
+                if title:
+                    lines.append(f"- {title}")
+                for key in ("topics", "subtopics", "concepts", "learning_objectives"):
+                    children = entry.get(key)
+                    if isinstance(children, list):
+                        lines.extend(f"  - {item if isinstance(item, str) else item.get('name', item.get('topic', str(item)))}" for item in children)
+        if len(lines) > 1:
+            parts.extend(lines)
+    render("Units and chapters", data.get("units"))
+    render("Topics", data.get("topics"))
+    render("Learning objectives", data.get("learning_objectives"))
+    render("Marks distribution", data.get("marks_distribution"))
+    return "\n".join(parts).strip()
+
+
+def _migrate_syllabuses_separate_storage(db) -> None:
+    """Copy only explicit Syllabus Library entries into their own BLOB table."""
+    db.execute("""CREATE TABLE IF NOT EXISTS syllabuses (
+        id TEXT PRIMARY KEY,
+        subject_id TEXT NOT NULL REFERENCES subjects(subject_id) ON DELETE CASCADE,
+        filename TEXT NOT NULL,
+        content_blob BLOB NOT NULL,
+        summary_text TEXT NOT NULL DEFAULT '',
+        processing_status TEXT NOT NULL DEFAULT 'pending',
+        processing_error TEXT,
+        syllabus_name TEXT,
+        academic_year TEXT,
+        version INTEGER NOT NULL DEFAULT 1,
+        is_active INTEGER NOT NULL DEFAULT 0,
+        uploaded_by TEXT NOT NULL,
+        checksum_sha256 TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE(subject_id,version)
+    )""")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_syllabuses_subject_active ON syllabuses(subject_id,is_active)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_syllabuses_subject_status ON syllabuses(subject_id,processing_status,created_at)")
+    try:
+        legacy = db.execute("""SELECT s.syllabus_id,s.subject_id,s.original_filename,s.syllabus_name,s.academic_year,
+            s.status,s.processing_error,s.version,s.is_active,s.summary_json,s.created_by,s.created_at,s.updated_at,
+            d.content_blob,d.checksum_sha256
+            FROM syllabi s JOIN documents d ON d.document_id=s.document_id
+            WHERE lower(s.original_filename) LIKE '%.pdf' AND d.content_blob IS NOT NULL""").fetchall()
+    except Exception:
+        legacy = []
+    for row in legacy:
+        blob = bytes(row["content_blob"] or b"")
+        if not blob.startswith(b"%PDF-"):
+            continue
+        db.execute("""INSERT OR IGNORE INTO syllabuses(id,subject_id,filename,content_blob,summary_text,
+            processing_status,processing_error,syllabus_name,academic_year,version,is_active,uploaded_by,
+            checksum_sha256,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (row["syllabus_id"],row["subject_id"],row["original_filename"],blob,
+             _summary_to_text(row["summary_json"]),row["status"],row["processing_error"],
+             row["syllabus_name"],row["academic_year"],row["version"],row["is_active"],
+             row["created_by"],row["checksum_sha256"],row["created_at"],row["updated_at"]))
+    # Generation jobs retain historical rows while dropping the old FK to `syllabi`.
+    # New jobs now reference IDs in `syllabuses`.
+    try:
+        db.execute("""CREATE TABLE IF NOT EXISTS question_generation_jobs_v2 (
+            job_id TEXT PRIMARY KEY, created_by TEXT NOT NULL,
+            subject_id TEXT NOT NULL REFERENCES subjects(subject_id), syllabus_id TEXT NOT NULL,
+            status TEXT NOT NULL, request_json TEXT NOT NULL, progress_json TEXT NOT NULL DEFAULT '{}',
+            error TEXT, docx_blob BLOB, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)""")
+        db.execute("""INSERT OR IGNORE INTO question_generation_jobs_v2
+            SELECT job_id,created_by,subject_id,syllabus_id,status,request_json,progress_json,error,docx_blob,created_at,updated_at
+            FROM question_generation_jobs""")
+        db.execute("""CREATE TABLE IF NOT EXISTS question_generation_items_v2 (
+            item_id TEXT PRIMARY KEY, job_id TEXT NOT NULL REFERENCES question_generation_jobs_v2(job_id) ON DELETE CASCADE,
+            section TEXT NOT NULL, topic TEXT NOT NULL, marks INTEGER NOT NULL, type TEXT NOT NULL,
+            difficulty TEXT NOT NULL, source_module TEXT NOT NULL DEFAULT '',
+            source_heading TEXT NOT NULL DEFAULT '', position INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL,
+            question_json TEXT, error TEXT, retries INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL, updated_at TEXT NOT NULL)""")
+        db.execute("""INSERT OR IGNORE INTO question_generation_items_v2
+            SELECT item_id,job_id,section,topic,marks,type,difficulty,source_module,source_heading,position,status,question_json,error,retries,created_at,updated_at
+            FROM question_generation_items""")
+        db.execute("DROP TABLE question_generation_items")
+        db.execute("DROP TABLE question_generation_jobs")
+        db.execute("ALTER TABLE question_generation_jobs_v2 RENAME TO question_generation_jobs")
+        db.execute("ALTER TABLE question_generation_items_v2 RENAME TO question_generation_items")
+        db.execute("CREATE INDEX IF NOT EXISTS idx_generation_jobs_owner ON question_generation_jobs(created_by,created_at)")
+        db.execute("CREATE INDEX IF NOT EXISTS idx_generation_items_job_status ON question_generation_items(job_id,status)")
+    except Exception:
+        # Older installations may not have enabled generation tables yet.
+        pass
+
+
+def _migrate_syllabus_processing_retries(db) -> None:
+    """Persist automatic retry counts while keeping the original PDF in place."""
+    add_column_if_missing(db, "syllabuses", "processing_attempts", "INTEGER NOT NULL DEFAULT 0")
+
+
+def _migrate_generation_item_source_refs(db) -> None:
+    """Store validated syllabus provenance alongside each generated item."""
+    add_column_if_missing(db, "question_generation_items", "source_module", "TEXT NOT NULL DEFAULT ''")
+    add_column_if_missing(db, "question_generation_items", "source_heading", "TEXT NOT NULL DEFAULT ''")
+
+
+def _migrate_canonical_user_roles(db) -> None:
+    """Normalize legacy roles without touching user identity or assignments."""
+    db.execute("""UPDATE users
+        SET role=CASE WHEN LOWER(TRIM(COALESCE(role,'')))='admin' THEN 'admin' ELSE 'teacher' END
+        WHERE role IS NULL
+           OR role <> CASE WHEN LOWER(TRIM(COALESCE(role,'')))='admin' THEN 'admin' ELSE 'teacher' END""")
 
 
 MIGRATIONS: tuple[tuple[str, object], ...] = (
@@ -469,6 +665,12 @@ MIGRATIONS: tuple[tuple[str, object], ...] = (
     ("user_subject_permissions_v1", _migrate_user_subject_permissions),
     ("teacher_subjects_to_user_assignments_v1", _migrate_teacher_subjects_to_user_assignments),
     ("teacher_status_values_v1", _migrate_teacher_status_values),
+    ("smart_qpg_syllabus_generation_v1", _migrate_smart_qpg),
+    ("smart_qpg_syllabus_upload_status_v1", _migrate_syllabus_upload_status),
+    ("smart_qpg_syllabuses_separate_storage_v1", _migrate_syllabuses_separate_storage),
+    ("smart_qpg_syllabus_processing_retries_v1", _migrate_syllabus_processing_retries),
+    ("smart_qpg_generation_item_source_refs_v1", _migrate_generation_item_source_refs),
+    ("canonical_user_roles_v1", _migrate_canonical_user_roles),
 )
 
 

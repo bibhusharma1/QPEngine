@@ -8,6 +8,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from config.settings import JWT_SECRET, JWT_TTL_MINUTES
 from src.masterdeorca import database
+from src.masterdeorca.roles import ADMIN_ROLE, TEACHER_ROLE, normalize_stored_role, validate_role
 
 bearer = HTTPBearer(auto_error=False)
 
@@ -38,8 +39,34 @@ def require_user(credentials: HTTPAuthorizationCredentials | None = Depends(bear
 def require_admin(email: str = Depends(require_user)) -> str:
     with database.connect() as db:
         row = db.execute("SELECT role FROM users WHERE email=?", (email,)).fetchone()
-    if not row or row["role"] != "admin":
+    if not row or normalize_stored_role(row["role"]) != ADMIN_ROLE:
         raise HTTPException(status_code=403, detail="Admin role required")
+    return email
+
+
+def require_syllabus_manager(email: str = Depends(require_user)) -> str:
+    """Syllabus lifecycle changes are limited to administrators."""
+    with database.connect() as db:
+        row = db.execute("SELECT role FROM users WHERE email=?", (email,)).fetchone()
+    if not row or normalize_stored_role(row["role"]) != ADMIN_ROLE:
+        raise HTTPException(status_code=403, detail="Admin role required")
+    return email
+
+
+def require_syllabus_uploader(email: str = Depends(require_user)) -> str:
+    """Allow admins and authenticated teachers to request uploads.
+
+    Non-admins are still checked against the selected subject assignment by
+    the syllabus route before any file is persisted.
+    """
+    with database.connect() as db:
+        row = db.execute("SELECT role FROM users WHERE email=?", (email,)).fetchone()
+    if not row:
+        raise HTTPException(status_code=403, detail="Admin or assigned teacher role required")
+    try:
+        validate_role(row["role"])
+    except ValueError as exc:
+        raise HTTPException(status_code=403, detail="Only admins or teachers can upload syllabi") from exc
     return email
 
 
@@ -56,7 +83,7 @@ def require_admin_write(email: str = Depends(require_admin)) -> str:
 def _user_role(email: str) -> str:
     with database.connect() as db:
         row = db.execute("SELECT role FROM users WHERE email=?", (email,)).fetchone()
-    return row["role"] if row else "teacher"
+    return normalize_stored_role(row["role"]) if row else TEACHER_ROLE
 
 
 def accessible_subjects(email: str) -> set[str] | None:
@@ -66,9 +93,9 @@ def accessible_subjects(email: str) -> set[str] | None:
     immediately, without re-login or token claims.
     """
     role = _user_role(email)
-    if role == "admin":
+    if role == ADMIN_ROLE:
         return None
-    if role != "teacher":
+    if role != TEACHER_ROLE:
         return set()
     return set(database.get_teacher_subjects(email))
 
@@ -86,7 +113,7 @@ def require_subject_access(email: str, subject: str) -> None:
     """Raise 403 when a non-admin has not been assigned this subject."""
     from src.masterdeorca import database
     user = database.get_user_by_email(email)
-    if user and user.get("role") == "admin":
+    if user and normalize_stored_role(user.get("role")) == ADMIN_ROLE:
         return
     allowed = accessible_subjects(email)
     # Also check new assignment system
@@ -107,7 +134,7 @@ def filter_subjects(email: str, subjects: list[str]) -> list[str]:
     """Restrict a subject listing to what the principal may see."""
     from src.masterdeorca import database
     user = database.get_user_by_email(email)
-    if user and user.get("role") == "admin":
+    if user and normalize_stored_role(user.get("role")) == ADMIN_ROLE:
         return list(subjects)
     try:
         user_subjects = database.get_user_subjects_by_email(email)

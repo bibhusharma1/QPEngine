@@ -272,7 +272,9 @@ def _docx(paper: dict, target: Path) -> None:
     subject_label = paper.get("subject_name") or paper["subject"]
     if paper.get("subject_code"):
         subject_label += f" ({paper['subject_code']})"
-    meta.add_run(f"{subject_label}  |  {paper['exam_type']}\n")
+    meta.add_run(f"{subject_label}  |  {paper.get('examination_name') or paper['exam_type']}\n")
+    if paper.get("examination_name") and paper.get("exam_type") and paper["examination_name"].casefold() != paper["exam_type"].casefold():
+        meta.add_run(f"Examination type: {paper['exam_type']}\n")
     if paper.get("academic_year"):
         meta.add_run(f"Academic Year: {paper['academic_year']}  ")
     if paper.get("semester"):
@@ -288,9 +290,12 @@ def _docx(paper: dict, target: Path) -> None:
     separator.paragraph_format.space_after = Pt(6)
     _add_horizontal_rule(separator)
 
-    if paper.get("instructions"):
+    instructions = paper.get("instructions") or []
+    if isinstance(instructions, str):
+        instructions = [instructions] if instructions.strip() else []
+    if instructions:
         doc.add_heading("Instructions", level=2)
-        for instruction in paper["instructions"]:
+        for instruction in instructions:
             doc.add_paragraph(instruction, style="List Number")
 
     print_number = 1
@@ -315,6 +320,25 @@ def _docx(paper: dict, target: Path) -> None:
             p.add_run("\t")
             marks = p.add_run(f"[{item['marks']} Marks]")
             marks.bold = True
+            children = item.get("sub_questions") or item.get("subquestions") or []
+            if isinstance(children, list):
+                for child_index, child in enumerate(children):
+                    if isinstance(child, str):
+                        child_text, child_marks = child, None
+                    elif isinstance(child, dict):
+                        child_text = str(child.get("question_text") or child.get("text") or child.get("question") or "").strip()
+                        child_marks = child.get("marks")
+                    else:
+                        continue
+                    if not child_text:
+                        continue
+                    child_paragraph = doc.add_paragraph()
+                    child_paragraph.paragraph_format.left_indent = Inches(0.3)
+                    child_paragraph.paragraph_format.space_after = Pt(4)
+                    child_paragraph.add_run(f"({chr(97 + child_index)}) ")
+                    child_paragraph.add_run(child_text)
+                    if child_marks is not None:
+                        child_paragraph.add_run(f" [{child_marks} Marks]")
             provenance = []
             if item.get("source_pdf"):
                 provenance.append(f"Source PDF: {Path(str(item['source_pdf'])).name}")
@@ -356,9 +380,18 @@ def _docx(paper: dict, target: Path) -> None:
                         cells = word_table.add_row().cells
                         for cell, value in zip(cells, row):
                             cell.text = str(value)
+        if paper.get("show_section_totals") and section_data.get("marks") is not None:
+            total_line = doc.add_paragraph()
+            total_line.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+            total_line.add_run(f"Section total: {section_data['marks']} marks").bold = True
 
-    # Processing Accuracy Notice, after questions.
-    _add_processing_accuracy_notice(doc)
+    if paper.get("include_processing_accuracy_notice", True):
+        _add_processing_accuracy_notice(doc)
+
+    if paper.get("show_total_marks"):
+        total_line = doc.add_paragraph()
+        total_line.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+        total_line.add_run(f"Total marks: {paper['requested_total_marks']}").bold = True
 
     # References / Sources, after the notice.
     if reference_rows:
@@ -495,6 +528,9 @@ def _paper_summary(record: dict, *, docx_available: bool, stat_mtime: datetime |
             "subject": record.get("subject"), "paper_title": record.get("title"),
             "exam_type": record.get("exam_type"), "total_marks": record.get("total_marks"),
             "duration": record.get("duration"), "generated_at": generated_at,
+            "generation_job_id": record.get("generation_job_id"),
+            "syllabus_id": record.get("syllabus_id"),
+            "generation_status": record.get("generation_status"),
             "generated_by": record.get("generated_by"), "file_path": record.get("file_path"),
             "docx_available": docx_available,
             "docx_url": record.get("docx_url") or f"/api/question-papers/{record.get('paper_id')}/docx"}

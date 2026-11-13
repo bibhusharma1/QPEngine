@@ -82,10 +82,10 @@ def _save(subject: str, manifest: dict) -> None:
                    manifest_json=excluded.manifest_json,updated_at=excluded.updated_at""",
                 (subject_id, json.dumps(manifest, ensure_ascii=False), manifest["updated_at"]),
             )
-            try:
-                db.commit()
-            except Exception:
-                pass
+            # Commit failures must reach the caller. The connection context
+            # manager will only roll back if libsql still reports an active
+            # transaction, while preserving this original exception.
+            db.commit()
 
     attempts = 5
     last_error = None

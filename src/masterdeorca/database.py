@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import logging
 import uuid
 from datetime import datetime, timezone
 from typing import Any
@@ -16,6 +17,7 @@ from pwdlib import PasswordHash
 from src.masterdeorca import migrations
 
 _password_hash = PasswordHash.recommended()
+_logger = logging.getLogger(__name__)
 _SUBJECT_ID_NAMESPACE = uuid.UUID("bf54f1f5-1d81-4c12-8d70-29b7a414a0e2")
 
 
@@ -135,21 +137,27 @@ class _NormalizedConnection:
         return self._connection.close()
 
     def __enter__(self):
-        enter = getattr(self._connection, "__enter__", None)
-        if enter is not None:
-            enter()
+        # Own context handling here. libsql's Connection.__exit__ performs
+        # its own transaction cleanup, which can issue ROLLBACK after an
+        # explicit commit has already ended the transaction.
         return self
 
-    def __exit__(self, *exc):
-        exit_context = getattr(self._connection, "__exit__", None)
-        if exit_context is not None:
-            return exit_context(*exc)
-        if exc and exc[0] is not None:
-            rollback = getattr(self._connection, "rollback", None)
-            if rollback is not None:
-                rollback()
+    def __exit__(self, exc_type, exc, traceback):
+        if exc_type is not None:
+            # Preserve the operation's exception even if cleanup also fails.
+            _logger.error(
+                "Database operation failed; attempting rollback: %s: %s",
+                exc_type.__name__, exc,
+                exc_info=(exc_type, exc, traceback),
+            )
+            if bool(getattr(self._connection, "in_transaction", False)):
+                try:
+                    self._connection.rollback()
+                except Exception:
+                    _logger.exception("Database rollback failed while preserving original exception")
             return False
-        self._connection.commit()
+        if bool(getattr(self._connection, "in_transaction", False)):
+            self._connection.commit()
         return False
 
     def __getattr__(self, name):
@@ -410,6 +418,14 @@ def get_subject_id(subject_name: str) -> str | None:
     return str(row["subject_id"]) if row else None
 
 
+def get_subject_by_id(subject_id: str) -> dict[str, Any] | None:
+    with connect() as db:
+        row = db.execute(
+            "SELECT subject_id,subject_name FROM subjects WHERE subject_id=?", (subject_id,)
+        ).fetchone()
+    return dict(row) if row else None
+
+
 def get_document(subject_name: str, filename: str) -> dict[str, Any] | None:
     with connect() as db:
         row = db.execute(
@@ -605,10 +621,7 @@ def save_job(job: dict[str, Any]) -> None:
                 "result_json=excluded.result_json",
                 (job_id, subject, filename, status, stage, started_at, now, error, result_json),
             )
-            try:
-                db.commit()
-            except Exception:
-                pass
+            db.commit()
     _retry_db(_write)
 
 
@@ -635,7 +648,7 @@ def latest_job(subject: str, filename: str) -> dict[str, Any] | None:
 
 def get_teacher_by_id(teacher_id: int) -> dict | None:
     with connect() as db:
-        row = db.execute("SELECT id,email,name,role FROM users WHERE id=? AND role='teacher'", (teacher_id,)).fetchone()
+        row = db.execute("SELECT id,email,name,role FROM users WHERE id=? AND LOWER(TRIM(role))='teacher'", (teacher_id,)).fetchone()
     return dict(row) if row else None
 
 
@@ -661,6 +674,49 @@ def get_teacher_subjects(email: str) -> list[str]:
             except Exception:
                 subjects = []
     return subjects
+
+
+def get_teacher_subject_names_by_id(teacher_id: int) -> list[str]:
+    """Authoritative assignments from TEACHER_SUBJECTS for a USERS.id."""
+    with connect() as db:
+        rows = db.execute("""SELECT ts.subject_name
+            FROM teacher_subjects ts
+            JOIN users u ON u.id=ts.teacher_id
+            WHERE u.id=? ORDER BY ts.subject_name COLLATE NOCASE""", (teacher_id,)).fetchall()
+        return [str(row["subject_name"]) for row in rows]
+
+
+def get_teacher_subject_records_by_id(teacher_id: int) -> list[dict[str, Any]]:
+    """Resolve TEACHER_SUBJECTS names to real rows in SUBJECTS."""
+    with connect() as db:
+        rows = db.execute("""SELECT DISTINCT s.subject_id,s.subject_name
+            FROM users u
+            JOIN teacher_subjects ts ON ts.teacher_id=u.id
+            JOIN subjects s ON s.subject_name=ts.subject_name
+            WHERE u.id=? ORDER BY s.subject_name COLLATE NOCASE""", (teacher_id,)).fetchall()
+    return [{"id": row["subject_id"], "name": row["subject_name"],
+             "subject_id": row["subject_id"], "subject_name": row["subject_name"]}
+            for row in rows]
+
+
+def get_teacher_subject_resolution_by_id(teacher_id: int) -> dict[str, list]:
+    """Return canonical subject records and assignment names lacking a SUBJECTS row."""
+    with connect() as db:
+        rows = db.execute("""SELECT ts.subject_name,s.subject_id,s.subject_name AS canonical_name
+            FROM users u
+            JOIN teacher_subjects ts ON ts.teacher_id=u.id
+            LEFT JOIN subjects s ON s.subject_name=ts.subject_name
+            WHERE u.id=? ORDER BY ts.subject_name COLLATE NOCASE""", (teacher_id,)).fetchall()
+    subjects = []
+    unmapped = []
+    seen_subject_ids = set()
+    for row in rows:
+        if row["subject_id"] is None:
+            unmapped.append(str(row["subject_name"]))
+        elif row["subject_id"] not in seen_subject_ids:
+            subjects.append({"subject_id": row["subject_id"], "subject_name": row["canonical_name"]})
+            seen_subject_ids.add(row["subject_id"])
+    return {"subjects": subjects, "unmapped_subjects": unmapped}
 
 
 def set_teacher_subjects(teacher_id: int, subject_names: list[str]) -> None:
@@ -1005,6 +1061,18 @@ def get_user_subjects(user_id: int):
             return [dict(r) for r in rows]
         except Exception:
             return []
+
+
+def get_subject_records() -> list[dict[str, Any]]:
+    """All subjects with their canonical database IDs and names."""
+    with connect() as db:
+        rows = db.execute("SELECT subject_id,subject_name FROM subjects ORDER BY subject_name COLLATE NOCASE").fetchall()
+    records = []
+    for row in rows:
+        subject_id, subject_name = row["subject_id"], row["subject_name"]
+        records.append({"id": subject_id, "name": subject_name,
+                        "subject_id": subject_id, "subject_name": subject_name})
+    return records
 
 
 def get_user_subjects_by_email(email: str):

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import asyncio
 import hashlib
 import io
 import logging
@@ -17,21 +18,23 @@ from pathlib import Path
 from typing import Annotated, Literal
 from urllib.parse import quote
 
-from fastapi import BackgroundTasks, Body, Depends, FastAPI, File, HTTPException, Request, UploadFile, Query
+from fastapi import BackgroundTasks, Body, Depends, FastAPI, File, Form, HTTPException, Request, UploadFile, Query
 from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field, StrictInt, field_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, StrictInt, field_validator, model_validator
 
-from config.settings import CORS_ORIGINS, JWT_SECRET, MAX_UPLOAD_BYTES, STORAGE_ROOT, DEFAULT_TEACHER_PASSWORD
+from config.settings import CORS_ORIGINS, JWT_SECRET, MAX_UPLOAD_BYTES, STORAGE_ROOT
 from config.outputs import stage_output_dir
 from functions.QuesScrapper.ScrapethePDF.gpu_runtime import GpuRuntimeError, ensure_cuda, runtime_report
 from functions.QuesScrapper.ScrapethePDF.pdf_read import extract_pdf_text
 from src.masterdeorca import database
+from src.masterdeorca.roles import ADMIN_ROLE, TEACHER_ROLE, normalize_stored_role, validate_role
 from src.masterdeorca.security import (
-    accessible_subjects, filter_subjects, issue_token, require_admin, require_admin_write,
-    require_subject_access, require_user, require_write_user, subject_allowed,
+    accessible_subjects, issue_token, require_admin, require_admin_write,
+    require_subject_access, require_user, require_write_user, require_syllabus_manager,
+    require_syllabus_uploader, subject_allowed,
 )
 import src.masterdeorca.app as app_module
 from src.masterdeorca.services.pipeline import process_document_job, process_pdf_job, reconstruct_pdf
@@ -41,6 +44,7 @@ from src.masterdeorca.services import question_papers as question_papers_service
 from src.masterdeorca.services import basic_config as basic_config_service
 from src.masterdeorca.services import ui_configurations as ui_configurations_service
 from src.masterdeorca.services import dashboard_metrics as dashboard_metrics_service
+from src.masterdeorca.services import smart_qpg as smart_qpg_service
 from src.masterdeorca.reconciliation import worker as reconciliation_worker
 from src.masterdeorca import processing_manifest
 from src.masterdeorca.storage import (
@@ -81,6 +85,8 @@ def _startup() -> None:
         raise RuntimeError("QUES_RECONCILE_INTERVAL_HOURS must be 12 or 24.")
     database.initialize()
     database.mark_interrupted_jobs()
+    smart_qpg_service.recover_interrupted_jobs()
+    smart_qpg_service.resume_interrupted_syllabus_uploads()
     with database.connect() as db:
         database.ensure_subject_record(db, app_settings.DEFAULT_SUBJECT)
         # temporary test seed
@@ -201,9 +207,15 @@ class TeacherCreate(BaseModel):
     name: str = Field(min_length=1, max_length=120)
     email: str = Field(min_length=3, max_length=254)
     department: str | None = Field(default=None, max_length=64)
-    password: str | None = Field(default=None, max_length=256)
+    password: str = Field(min_length=8, max_length=256)
+    role: str = TEACHER_ROLE
     status: Literal["authorized", "unauthorized"] = "authorized"
     subjects: list[str] = Field(default_factory=list)
+
+    @field_validator("role")
+    @classmethod
+    def canonical_role(cls, value: str) -> str:
+        return validate_role(value)
 
 
 class TeacherUpdate(BaseModel):
@@ -215,7 +227,13 @@ class TeacherUpdate(BaseModel):
     department: str | None = None
     status: Literal["authorized", "unauthorized"] | None = None
     password: str | None = None
+    role: str | None = None
     subjects: list[str] | None = None
+
+    @field_validator("role")
+    @classmethod
+    def canonical_role(cls, value: str | None) -> str | None:
+        return validate_role(value) if value is not None else None
 
 
 class TeacherSubjectAssign(BaseModel):
@@ -237,6 +255,123 @@ class TopicCreate(BaseModel):
     name: str = Field(min_length=1, max_length=120)
     unit: int | None = Field(default=None, ge=1)
     description: str | None = None
+
+
+class GenerationSection(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    name: str = Field(min_length=1, max_length=40)
+    instructions: str = Field(default="", max_length=2000)
+    question_count: int = Field(ge=1, le=100, validation_alias=AliasChoices("question_count", "count"))
+    marks_per_question: int = Field(ge=1, le=100, validation_alias=AliasChoices("marks_per_question", "marks"))
+    question_type: str = Field(min_length=1, max_length=40, validation_alias=AliasChoices("question_type", "type"))
+    difficulty: str = Field(min_length=1, max_length=40)
+    topic: str | None = Field(default=None, max_length=200)
+
+    @field_validator("name", "question_type", "difficulty")
+    @classmethod
+    def required_non_blank(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("must not be empty")
+        return value
+
+
+class SelectedSyllabusTopic(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    module_name: str = Field(min_length=1, max_length=160)
+    heading: str = Field(min_length=1, max_length=200)
+    topic: str = Field(min_length=1, max_length=300)
+
+
+class QuestionGenerationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    configuration_id: str | None = Field(default=None, validation_alias=AliasChoices("configuration_id", "config_id"))
+    university_name: str | None = Field(default=None, max_length=200, validation_alias=AliasChoices("university_name", "university", "institution", "institution_name"))
+    college_name: str | None = Field(default=None, max_length=200, validation_alias=AliasChoices("college_name", "college"))
+    department_name: str | None = Field(default=None, max_length=200, validation_alias=AliasChoices("department_name", "department"))
+    paper_title: str | None = Field(default=None, max_length=200)
+    academic_year: str | None = Field(default=None, max_length=40)
+    semester: str | None = Field(default=None, max_length=40)
+    exam_type: str | None = Field(default=None, max_length=100)
+    subject: str | None = Field(default=None, max_length=100)
+    subject_id: str = Field(min_length=1, max_length=100)
+    subject_code: str | None = Field(default=None, max_length=100)
+    examination_date: str | None = Field(default=None, max_length=80, validation_alias=AliasChoices("examination_date", "exam_date"))
+    duration: str | None = Field(default=None, max_length=100)
+    total_marks: int | None = Field(default=None, ge=1, le=1000)
+    instructions: str | list[str] = ""
+    syllabus_id: str = Field(min_length=1, max_length=100)
+    examination_name: str | None = Field(default=None, max_length=200)
+    blueprint_id: str | None = Field(default=None, max_length=100)
+    blueprint_name: str | None = Field(default=None, max_length=200)
+    blueprint_description: str | None = Field(default=None, max_length=2000)
+    selected_topics: list[str] = Field(default_factory=list, max_length=100, validation_alias=AliasChoices("selected_topics", "topics"))
+    selected_modules: list[str] = Field(default_factory=list, max_length=50)
+    selected_scope: list[SelectedSyllabusTopic] = Field(default_factory=list, max_length=300)
+    sections: list[GenerationSection] = Field(min_length=1, max_length=30)
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_regular_generation_fields(cls, value):
+        if not isinstance(value, dict):
+            return value
+        value = dict(value)
+        # The regular Generate Paper UI sends its saved keys and also sends
+        # college_name explicitly for legacy consumers. Collapse these pairs
+        # before strict extra-field validation.
+        for canonical, aliases in {
+            "university_name": ("university", "institution", "institution_name"),
+            "college_name": ("college",),
+            "department_name": ("department",),
+            "examination_date": ("exam_date",),
+            "selected_topics": ("topics",),
+            "selected_modules": ("modules",),
+            "selected_scope": ("selected_module_topics", "module_topics"),
+        }.items():
+            for alias in aliases:
+                if alias in value:
+                    value.setdefault(canonical, value[alias])
+                    value.pop(alias, None)
+        return value
+
+    @field_validator("subject_id", "syllabus_id")
+    @classmethod
+    def required_non_blank(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("must not be empty")
+        return value
+
+    @field_validator("selected_topics")
+    @classmethod
+    def clean_topics(cls, values: list[str]) -> list[str]:
+        cleaned = [value.strip() for value in values]
+        if any(not value for value in cleaned) or len({value.casefold() for value in cleaned}) != len(cleaned):
+            raise ValueError("selected topics must be non-empty and unique")
+        return cleaned
+
+    @field_validator("selected_modules")
+    @classmethod
+    def clean_modules(cls, values: list[str]) -> list[str]:
+        cleaned = [value.strip() for value in values]
+        if any(not value for value in cleaned) or len({value.casefold() for value in cleaned}) != len(cleaned):
+            raise ValueError("selected modules must be non-empty and unique")
+        return cleaned
+
+    @field_validator("total_marks", mode="before")
+    @classmethod
+    def parse_total_marks(cls, value):
+        if isinstance(value, str) and value.strip().isdigit():
+            return int(value.strip())
+        return value
+
+
+class GeneratedQuestionEdit(BaseModel):
+    question: dict | None
+
+
+class ApproveQuestions(BaseModel):
+    item_ids: list[str] = Field(min_length=1, max_length=300)
 
 
 class QuestionPriorityUpdate(BaseModel):
@@ -388,6 +523,8 @@ class BasicConfigurationPatch(BaseModel):
 
 Admin = Annotated[str, Depends(require_admin)]
 AdminWrite = Annotated[str, Depends(require_admin_write)]
+SyllabusManager = Annotated[str, Depends(require_syllabus_manager)]
+SyllabusUploader = Annotated[str, Depends(require_syllabus_uploader)]
 UserWrite = Annotated[str, Depends(require_write_user)]
 
 
@@ -960,6 +1097,404 @@ def delete_ui_configuration(configuration_id: str, user: Annotated[str, Depends(
         raise HTTPException(status_code=404, detail="Configuration not found")
 
 
+def _smart_qpg_subject(user: str, subject_id: str) -> dict:
+    subject = database.get_subject_by_id(subject_id)
+    if not subject:
+        raise HTTPException(status_code=404, detail="Subject not found")
+    role = normalize_stored_role(_user_row(user).get("role"))
+    if role != ADMIN_ROLE:
+        require_subject_access(user, subject["subject_name"])
+        _enforce_subject_permission(user, subject["subject_name"], "view_papers")
+    return subject
+
+
+def _smart_qpg_job(user: str, job_id: str) -> dict:
+    job = smart_qpg_service.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Question generation job not found")
+    _require_owner_or_admin(user, {"created_by": job["created_by"]}, owner_field="created_by")
+    subject = _smart_qpg_subject(user, job["subject_id"])
+    job["subject_name"] = subject["subject_name"]
+    return job
+
+
+@app.get("/api/smart-qpg/subjects", tags=["syllabus"])
+def smart_qpg_subjects(user: Annotated[str, Depends(require_user)]) -> dict:
+    principal, role = _syllabus_principal(user)
+    if role == ADMIN_ROLE:
+        subjects = database.get_subject_records()
+    elif role == TEACHER_ROLE:
+        subjects = database.get_teacher_subject_records_by_id(principal["id"])
+    else:
+        raise HTTPException(status_code=403, detail="This account cannot view syllabus subjects")
+    return {"subjects": subjects}
+
+
+def _require_syllabus_subject_access(user: str, subject_id: str) -> dict:
+    subject = database.get_subject_by_id(subject_id)
+    if not subject:
+        raise HTTPException(status_code=404, detail="Subject not found")
+    principal, role = _syllabus_principal(user)
+    if role == ADMIN_ROLE:
+        return subject
+    if role != TEACHER_ROLE:
+        raise HTTPException(status_code=403, detail="This account cannot access syllabi")
+    if subject["subject_name"] not in set(database.get_teacher_subject_names_by_id(principal["id"])):
+        raise HTTPException(status_code=403, detail="Subject access is not assigned to this account")
+    return subject
+
+
+def _syllabus_principal(email: str) -> tuple[dict, str]:
+    """Resolve a syllabus principal without treating unknown stored roles as teachers."""
+    principal = _user_row(email)
+    with database.connect() as db:
+        row = db.execute("SELECT role FROM users WHERE id=?", (principal["id"],)).fetchone()
+    try:
+        role = validate_role(row["role"] if row else None)
+    except ValueError as exc:
+        raise HTTPException(status_code=403, detail="This account cannot access syllabus resources") from exc
+    return principal, role
+
+
+@app.get("/api/smart-qpg/subjects/{subject_id}/syllabi", tags=["syllabus"])
+def smart_qpg_syllabi(subject_id: str, user: Annotated[str, Depends(require_user)],
+                      status: Literal["pending", "processing", "completed", "failed"] | None = None) -> dict:
+    _require_syllabus_subject_access(user, subject_id)
+    return {"syllabi": smart_qpg_service.list_syllabi(subject_id, status)}
+
+
+def _validate_syllabus_content(filename: str, content_type: str | None, content: bytes) -> None:
+    suffix = Path(filename).suffix.lower()
+    mime = (content_type or "").casefold()
+    if suffix == ".pdf":
+        if mime not in {"application/pdf", "application/x-pdf"}:
+            raise HTTPException(status_code=415, detail="The uploaded PDF must have PDF MIME type.")
+        detect_document_type(filename, content[:1024])
+        try:
+            import pymupdf
+            with pymupdf.open(stream=content, filetype="pdf") as pdf:
+                if pdf.page_count < 1:
+                    raise ValueError("The PDF has no pages.")
+        except Exception as exc:
+            raise HTTPException(status_code=415, detail="The uploaded PDF is corrupted, encrypted, or unreadable.") from exc
+        return
+    if suffix == ".docx":
+        accepted = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        if mime not in {accepted, "application/octet-stream"}:
+            raise HTTPException(status_code=415, detail="The uploaded DOCX must have Word document MIME type.")
+        detect_document_type(filename, content[:1024])
+        try:
+            with zipfile.ZipFile(io.BytesIO(content)) as archive:
+                if "word/document.xml" not in archive.namelist():
+                    raise ValueError("Missing Word document body")
+        except Exception as exc:
+            raise HTTPException(status_code=415, detail="The uploaded DOCX is corrupted or unreadable.") from exc
+        return
+    raise HTTPException(status_code=415, detail="Only PDF and DOCX syllabi are accepted.")
+
+
+def _authorize_syllabus_upload_subject(user: str, subject: dict) -> None:
+    """Admins are global; teachers must have a DB subject assignment."""
+    principal, role = _syllabus_principal(user)
+    if role == ADMIN_ROLE:
+        return
+    if role != TEACHER_ROLE:
+        raise HTTPException(status_code=403, detail="Only admins or assigned teachers can upload syllabi.")
+    assigned = set(database.get_teacher_subject_names_by_id(principal["id"]))
+    if subject["subject_name"] not in assigned:
+        raise HTTPException(status_code=403, detail="Syllabus uploads are limited to subjects assigned to this account.")
+
+
+async def _upload_syllabus(subject_id: str, *, user: str, file: UploadFile,
+                           background_tasks: BackgroundTasks, syllabus_name: str | None,
+                           academic_year: str | None, replace: bool) -> dict:
+    subject = database.get_subject_by_id(subject_id)
+    if not subject:
+        raise HTTPException(status_code=404, detail="Subject not found")
+    _authorize_syllabus_upload_subject(user, subject)
+    filename = validate_document_filename(file.filename or "")
+    if Path(filename).suffix.lower() not in {".pdf", ".docx"}:
+        raise HTTPException(status_code=415, detail="Only PDF and DOCX syllabi are accepted.")
+    spool = tempfile.SpooledTemporaryFile(max_size=2 * 1024 * 1024, mode="w+b")
+    try:
+        header = await file.read(1024)
+        detect_document_type(filename, header)
+        if len(header) > MAX_UPLOAD_BYTES:
+            raise HTTPException(status_code=413, detail="Syllabus exceeds the configured upload limit.")
+        size = len(header)
+        spool.write(header)
+        while chunk := await file.read(1024 * 1024):
+            size += len(chunk)
+            if size > MAX_UPLOAD_BYTES:
+                raise HTTPException(status_code=413, detail="Syllabus exceeds the configured upload limit.")
+            spool.write(chunk)
+        spool.seek(0)
+        content = spool.read()
+        _validate_syllabus_content(filename, file.content_type, content)
+        try:
+            result = smart_qpg_service.create_syllabus_upload(
+                subject_id=subject_id, filename=filename, content=content,
+                syllabus_name=syllabus_name, academic_year=academic_year,
+                created_by=user, replace=replace)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Subject not found") from exc
+        except smart_qpg_service.SyllabusConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except Exception as exc:
+            logger.exception("Could not persist uploaded syllabus for subject %s", subject_id)
+            raise HTTPException(status_code=500, detail="Could not persist the syllabus upload.") from exc
+        background_tasks.add_task(smart_qpg_service.process_syllabus_upload, result["syllabus_id"])
+        return result
+    finally:
+        spool.close()
+        await file.close()
+
+
+@app.post("/api/smart-qpg/syllabi", status_code=202, tags=["syllabus"])
+async def upload_syllabus(background_tasks: BackgroundTasks, user: SyllabusUploader,
+                          subject_id: Annotated[str, Form()], file: Annotated[UploadFile, File()],
+                          syllabus_name: Annotated[str | None, Form()] = None,
+                          academic_year: Annotated[str | None, Form()] = None,
+                          replace: Annotated[bool, Form()] = False) -> dict:
+    try:
+        return await _upload_syllabus(subject_id, user=user, file=file, background_tasks=background_tasks,
+                                      syllabus_name=syllabus_name, academic_year=academic_year, replace=replace)
+    finally:
+        await file.close()
+
+
+@app.post("/api/smart-qpg/subjects/{subject_id}/syllabi", status_code=202, tags=["syllabus"])
+async def upload_subject_syllabus(subject_id: str, background_tasks: BackgroundTasks, user: SyllabusUploader,
+                                  file: Annotated[UploadFile, File()],
+                                  syllabus_name: Annotated[str | None, Form()] = None,
+                                  academic_year: Annotated[str | None, Form()] = None,
+                                  replace: Annotated[bool, Form()] = False) -> dict:
+    try:
+        return await _upload_syllabus(subject_id, user=user, file=file, background_tasks=background_tasks,
+                                      syllabus_name=syllabus_name, academic_year=academic_year, replace=replace)
+    finally:
+        await file.close()
+
+
+@app.get("/api/smart-qpg/syllabi", tags=["syllabus"])
+@app.get("/api/syllabi", tags=["syllabus"])
+def list_smart_qpg_syllabi(user: Annotated[str, Depends(require_user)],
+                           subject_id: str | None = None,
+                           status: Literal["pending", "processing", "completed", "failed"] | None = None) -> dict:
+    principal, role = _syllabus_principal(user)
+    if subject_id is not None:
+        _require_syllabus_subject_access(user, subject_id)
+    records = smart_qpg_service.list_syllabi(subject_id, status)
+    if role != ADMIN_ROLE:
+        if role != TEACHER_ROLE:
+            raise HTTPException(status_code=403, detail="This account cannot access syllabi")
+        allowed = set(database.get_teacher_subject_names_by_id(principal["id"]))
+        records = [record for record in records
+                   if (subject := database.get_subject_by_id(record["subject_id"]))
+                   and subject["subject_name"] in allowed]
+    return {"syllabi": records}
+
+
+@app.get("/api/smart-qpg/syllabi/{syllabus_id}/status", tags=["syllabus"])
+def syllabus_processing_status(syllabus_id: str, user: Annotated[str, Depends(require_user)]) -> dict:
+    syllabus = smart_qpg_service.get_syllabus(syllabus_id)
+    if not syllabus:
+        raise HTTPException(status_code=404, detail="Syllabus not found")
+    _require_syllabus_subject_access(user, syllabus["subject_id"])
+    return {key: syllabus.get(key) for key in
+            ("syllabus_id", "subject_id", "subject_name", "status", "processing_error", "updated_at")}
+
+
+@app.post("/api/smart-qpg/syllabi/{syllabus_id}/reprocess", status_code=202, tags=["syllabus"])
+def reprocess_syllabus(syllabus_id: str, background_tasks: BackgroundTasks,
+                       user: Annotated[str, Depends(require_user)]) -> dict:
+    syllabus = smart_qpg_service.get_syllabus(syllabus_id)
+    if not syllabus:
+        raise HTTPException(status_code=404, detail="Syllabus not found")
+    # Admins can manage every syllabus; teachers can retry only an assigned subject.
+    _require_syllabus_subject_access(user, syllabus["subject_id"])
+    try:
+        queued = smart_qpg_service.queue_syllabus_reprocessing(syllabus_id)
+    except smart_qpg_service.SyllabusAlreadyProcessingError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("Could not queue syllabus reprocessing for %s", syllabus_id)
+        raise HTTPException(status_code=500, detail="Could not queue syllabus reprocessing.") from exc
+    if not queued:
+        raise HTTPException(status_code=404, detail="Syllabus not found")
+    background_tasks.add_task(smart_qpg_service.process_syllabus_upload, syllabus_id)
+    return {"syllabus_id": syllabus_id, "status": "processing",
+            "processing_attempts": queued.get("processing_attempts"),
+            "processing_error": None}
+
+
+@app.get("/api/smart-qpg/syllabi/{syllabus_id}", tags=["syllabus"])
+def get_syllabus(syllabus_id: str, user: Annotated[str, Depends(require_user)]) -> dict:
+    syllabus = smart_qpg_service.get_syllabus(syllabus_id)
+    if not syllabus:
+        raise HTTPException(status_code=404, detail="Syllabus not found")
+    _require_syllabus_subject_access(user, syllabus["subject_id"])
+    return syllabus
+
+
+@app.get("/api/smart-qpg/syllabi/{syllabus_id}/document", tags=["syllabus"])
+def download_syllabus_document(syllabus_id: str, user: Annotated[str, Depends(require_user)]) -> Response:
+    syllabus = smart_qpg_service.get_syllabus(syllabus_id)
+    if not syllabus:
+        raise HTTPException(status_code=404, detail="Syllabus not found")
+    _require_syllabus_subject_access(user, syllabus["subject_id"])
+    content = smart_qpg_service.syllabus_upload_content(syllabus_id)
+    if content is None:
+        raise HTTPException(status_code=404, detail="Syllabus document is unavailable")
+    return Response(content=content, media_type="application/pdf",
+                    headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(syllabus['original_filename'], safe='')}"})
+
+
+@app.put("/api/smart-qpg/syllabi/{syllabus_id}/active", tags=["syllabus"])
+def activate_syllabus(syllabus_id: str, user: SyllabusManager) -> dict:
+    try:
+        result = smart_qpg_service.set_active_syllabus(syllabus_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if not result:
+        raise HTTPException(status_code=404, detail="Syllabus not found")
+    return result
+
+
+@app.put("/api/smart-qpg/syllabi/{syllabus_id}/deactivate", tags=["syllabus"])
+def deactivate_syllabus(syllabus_id: str, user: SyllabusManager) -> dict:
+    result = smart_qpg_service.set_syllabus_active(syllabus_id, False)
+    if not result:
+        raise HTTPException(status_code=404, detail="Syllabus not found")
+    return result
+
+
+@app.delete("/api/smart-qpg/syllabi/{syllabus_id}", status_code=204, tags=["syllabus"])
+def delete_syllabus(syllabus_id: str, user: SyllabusManager) -> None:
+    syllabus = smart_qpg_service.get_syllabus(syllabus_id)
+    if not syllabus:
+        raise HTTPException(status_code=404, detail="Syllabus not found")
+    with database.connect() as db:
+        used = db.execute("SELECT 1 FROM question_generation_jobs WHERE syllabus_id=? LIMIT 1", (syllabus_id,)).fetchone()
+        if used:
+            raise HTTPException(status_code=409, detail="This syllabus is referenced by a generation job and cannot be deleted.")
+        db.execute("DELETE FROM syllabuses WHERE id=?", (syllabus_id,))
+
+
+@app.post("/api/smart-qpg/generation-jobs", status_code=202, tags=["question generation"])
+def create_question_generation_job(request: QuestionGenerationRequest, background_tasks: BackgroundTasks,
+                                  user: Annotated[str, Depends(require_write_user)]) -> dict:
+    _smart_qpg_subject(user, request.subject_id)
+    _enforce_subject_permission(user, database.get_subject_by_id(request.subject_id)["subject_name"], "generate_papers")
+    syllabus = smart_qpg_service.get_syllabus(request.syllabus_id)
+    if not syllabus:
+        raise HTTPException(status_code=404, detail="Syllabus not found")
+    if syllabus["subject_id"] != request.subject_id:
+        raise HTTPException(status_code=422, detail="Syllabus does not belong to the selected subject.")
+    payload = request.model_dump()
+    payload["sections"] = [section.model_dump() for section in request.sections]
+    try:
+        job_id = smart_qpg_service.create_job(user=user, subject_id=request.subject_id,
+                                              syllabus_id=request.syllabus_id, request=payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    background_tasks.add_task(smart_qpg_service.start_job, job_id)
+    return {"job_id": job_id, "status": "queued", "total_questions": payload["calculated_total_questions"],
+            "total_marks": payload["calculated_total_marks"]}
+
+
+@app.get("/api/smart-qpg/generation-jobs/{job_id}", tags=["question generation"])
+def get_question_generation_job(job_id: str, user: Annotated[str, Depends(require_user)]) -> dict:
+    return _smart_qpg_job(user, job_id)
+
+
+@app.post("/api/smart-qpg/generation-jobs/{job_id}/retry", status_code=202, tags=["question generation"])
+def retry_question_generation_job(job_id: str, background_tasks: BackgroundTasks,
+                                 user: Annotated[str, Depends(require_write_user)]) -> dict:
+    _smart_qpg_job(user, job_id)
+    if not smart_qpg_service.retry_job(job_id):
+        raise HTTPException(status_code=409, detail="This generation job cannot be retried in its current state.")
+    background_tasks.add_task(smart_qpg_service.start_job, job_id)
+    return {"job_id": job_id, "status": "queued"}
+
+
+@app.post("/api/smart-qpg/generation-jobs/{job_id}/cancel", tags=["question generation"])
+def cancel_question_generation_job(job_id: str, user: Annotated[str, Depends(require_write_user)]) -> dict:
+    _smart_qpg_job(user, job_id)
+    if not smart_qpg_service.cancel_job(job_id):
+        raise HTTPException(status_code=409, detail="This generation job cannot be cancelled in its current state.")
+    return {"job_id": job_id, "status": "cancelling"}
+
+
+@app.patch("/api/smart-qpg/generation-jobs/{job_id}/items/{item_id}", tags=["question generation"])
+def edit_generated_question(job_id: str, item_id: str, payload: GeneratedQuestionEdit,
+                            user: Annotated[str, Depends(require_write_user)]) -> dict:
+    job = _smart_qpg_job(user, job_id)
+    question = payload.question
+    if question is not None:
+        try:
+            question = smart_qpg_service.GeneratedQuestion.model_validate(question).model_dump()
+        except Exception as exc:
+            raise HTTPException(status_code=422, detail="Question fields are invalid.") from exc
+    try:
+        updated = smart_qpg_service.edit_item(job_id, item_id, question)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if not updated:
+        raise HTTPException(status_code=404, detail="Editable draft question not found")
+    return smart_qpg_service.get_job(job_id)
+
+
+@app.post("/api/smart-qpg/generation-jobs/{job_id}/items/{item_id}/regenerate", tags=["question generation"])
+async def regenerate_generated_question(job_id: str, item_id: str,
+                                        user: Annotated[str, Depends(require_write_user)]) -> dict:
+    _smart_qpg_job(user, job_id)
+    try:
+        question = await smart_qpg_service.regenerate_item(job_id, item_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail="Question regeneration failed.") from exc
+    return {"item_id": item_id, "question": question}
+
+
+@app.post("/api/smart-qpg/generation-jobs/{job_id}/approve", tags=["question generation"])
+def approve_generated_questions(job_id: str, payload: ApproveQuestions,
+                                user: Annotated[str, Depends(require_write_user)]) -> dict:
+    _smart_qpg_job(user, job_id)
+    count = smart_qpg_service.approve_items(job_id, payload.item_ids)
+    if count != len(set(payload.item_ids)):
+        raise HTTPException(status_code=422, detail="One or more selected questions are not editable drafts.")
+    updated = smart_qpg_service.get_job(job_id)
+    paper = None
+    if updated and updated["items"] and all(item["status"] == "approved" for item in updated["items"]):
+        try:
+            smart_qpg_service.render_job_docx(job_id)
+            paper = {"paper_id": job_id, "docx_available": True}
+        except Exception as exc:
+            logger.exception("Could not create approved question paper DOCX for job %s", job_id)
+            raise HTTPException(status_code=502, detail="Questions were approved, but the DOCX could not be validated and saved.") from exc
+    return {"approved": count, "paper": paper}
+
+
+@app.get("/api/smart-qpg/generation-jobs/{job_id}/docx", tags=["question generation"])
+def download_generated_question_paper(job_id: str, user: Annotated[str, Depends(require_user)]) -> Response:
+    _smart_qpg_job(user, job_id)
+    with database.connect() as db:
+        row = db.execute("SELECT docx_blob FROM question_generation_jobs WHERE job_id=?", (job_id,)).fetchone()
+        paper = db.execute("SELECT 1 FROM generated_papers WHERE paper_id=?", (job_id,)).fetchone()
+    content = bytes(row["docx_blob"]) if row and row["docx_blob"] is not None else None
+    if content is None or not paper:
+        try:
+            content = smart_qpg_service.render_job_docx(job_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return Response(content=content, media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    headers={"Content-Disposition": f'attachment; filename="smart-qpg-{job_id}.docx"'})
+
+
 @app.post("/api/question-papers/generate", tags=["question papers"])
 def generate_question_paper(request: QuestionPaperGenerate, user: Annotated[str, Depends(require_write_user)]) -> dict:
     try:
@@ -1265,8 +1800,14 @@ def change_email(request: ChangeEmailRequest, email: Annotated[str, Depends(requ
 
 @app.get("/subjects", tags=["subjects"])
 def list_subjects(user: Annotated[str, Depends(require_user)]) -> dict:
-    # Administrators see every registered subject; teachers only their assigned ones.
-    return {"subjects": filter_subjects(user, list_subject_names())}
+    """List registered subjects, retaining names for legacy clients and adding canonical IDs."""
+    principal = _user_row(user)
+    records = database.get_subject_records()
+    if principal["role"] != ADMIN_ROLE:
+        assigned = set(database.get_teacher_subject_names_by_id(principal["id"]))
+        records = [record for record in records if record["subject_name"] in assigned]
+    return {"subjects": [record["subject_name"] for record in records],
+            "subject_records": records}
 
 
 @app.post("/subjects", status_code=201, tags=["subjects"])
@@ -1627,7 +2168,9 @@ def _user_row(email: str) -> dict:
         row = db.execute("SELECT id,email,name,role,status FROM users WHERE email=?", (email,)).fetchone()
     if not row:
         raise HTTPException(status_code=401, detail="Authenticated user no longer exists")
-    return dict(row)
+    result = dict(row)
+    result["role"] = normalize_stored_role(result.get("role"))
+    return result
 
 
 def _require_owner_or_admin(user: str, record: dict, *, owner_field: str) -> None:
@@ -1669,7 +2212,7 @@ def _docx_has_word_entries(path: Path | bytes) -> bool:
 @app.get("/auth/me", tags=["authentication"])
 def current_user(email: Annotated[str, Depends(require_user)]) -> dict:
     row = _user_row(email)
-    if row["role"] == "admin":
+    if row["role"] == ADMIN_ROLE:
         row["subjects"] = list_subject_names()
     else:
         # Include both teacher assignments and user-subject assignments
@@ -1814,10 +2357,12 @@ def _validated_subjects(names: list[str]) -> list[str]:
     return subjects
 
 
-def _teacher(row: dict) -> dict:
-    subjects = database.get_teacher_subjects(row["email"])
+def _teacher(row: dict, assigned_subjects: list[str] | None = None) -> dict:
+    subjects = (database.get_teacher_subject_names_by_id(row["id"])
+                if assigned_subjects is None else assigned_subjects)
     return {"id": row["id"], "name": row["name"], "email": row["email"],
-            "department": row.get("department") or "", "status": row["status"],
+            "department": row.get("department") or "", "role": row.get("role", "teacher"),
+            "status": row["status"],
             "subject_count": len(subjects), "subjects": subjects,
             "created_at": row["created_at"]}
 
@@ -1826,7 +2371,9 @@ def _teacher(row: dict) -> dict:
 @app.get("/users", tags=["users"])
 def list_teachers_or_users(_: Admin, status: str | None = None, search: str | None = None,
                           page: int = Query(1, ge=1), page_size: int = Query(50, ge=1, le=200)) -> dict:
-    clauses, args = ["role='teacher'"], []
+    # HODs are teaching staff too. Paginate USERS before joining assignments
+    # so staff without an assignment still appears exactly once.
+    clauses, args = ["LOWER(TRIM(role))='teacher'"], []
     if status:
         clauses.append("status=?"); args.append(status)
     if search:
@@ -1834,15 +2381,32 @@ def list_teachers_or_users(_: Admin, status: str | None = None, search: str | No
     where = " AND ".join(clauses)
     with database.connect() as db:
         total = db.execute(f"SELECT count(*) FROM users WHERE {where}", args).fetchone()[0]
-        rows = db.execute(f"""SELECT id,name,email,department,status,created_at
-                FROM users WHERE {where} ORDER BY id LIMIT ? OFFSET ?""",
+        rows = db.execute(f"""SELECT staff.id,staff.name,staff.email,staff.department,staff.role,staff.status,
+                staff.created_at,ts.subject_name
+            FROM (SELECT id,name,email,department,role,status,created_at FROM users
+                  WHERE {where} ORDER BY id LIMIT ? OFFSET ?) staff
+            LEFT JOIN teacher_subjects ts ON ts.teacher_id=staff.id
+            ORDER BY staff.id,ts.subject_name COLLATE NOCASE""",
                           [*args, page_size, (page - 1) * page_size]).fetchall()
-    return {"teachers": [_teacher(dict(row)) for row in rows], "total": total}
+    grouped: dict[int, dict] = {}
+    for row in rows:
+        user_id = int(row["id"])
+        if user_id not in grouped:
+            grouped[user_id] = {key: row[key] for key in
+                                ("id", "name", "email", "department", "role", "status", "created_at")}
+            grouped[user_id]["_assigned_subjects"] = []
+        if row["subject_name"] is not None:
+            grouped[user_id]["_assigned_subjects"].append(str(row["subject_name"]))
+    teachers = []
+    for record in grouped.values():
+        assigned = list(dict.fromkeys(record.pop("_assigned_subjects")))
+        teachers.append(_teacher(record, assigned))
+    return {"teachers": teachers, "total": total}
 
 
 @app.post("/teachers", status_code=201, tags=["teachers"])
+@app.post("/users", status_code=201, tags=["users"])
 def create_teacher(request: TeacherCreate, _: AdminWrite) -> dict:
-    from src.masterdeorca.database import _password_hash
     email = request.email.strip().lower()
     status = request.status or "authorized"
     if status not in {"authorized", "unauthorized"}:
@@ -1852,42 +2416,33 @@ def create_teacher(request: TeacherCreate, _: AdminWrite) -> dict:
     # Teacher creation establishes an account only. Subject access is granted
     # later through the explicit assignment endpoints.
     subjects: list[str] = []
-    if not (request.password or "").strip():
-        password = DEFAULT_TEACHER_PASSWORD
-        password_supplied = False
-    else:
-        password = request.password
-        password_supplied = True
-        if len(password) < 8:
-            raise HTTPException(status_code=422, detail="Password must contain at least 8 characters.")
-    logger.info("Teacher creation started: email=%s password_supplied=%s password_length=%d", email, password_supplied, len(password))
+    password = request.password
+    logger.info("User account creation started: email=%s role=%s", email, request.role)
     password_hash = database._password_hash.hash(password)
     if not database._password_hash.verify(password, password_hash):
-        logger.error("Teacher creation hashing verification failed: email=%s", email)
+        logger.error("User creation hashing verification failed: email=%s", email)
         raise HTTPException(status_code=500, detail="Password hashing verification failed.")
-    logger.info("Teacher creation hashing ok: email=%s algorithm=%s", email, password_hash.split("$", 3)[1] if "$" in password_hash else "argon2")
     now = _now()
     try:
         with database.connect() as db:
-            cur = db.execute("INSERT INTO users(email,name,hashed_password,role,status,created_at) VALUES(?,?,?,?,?,?)",
-                             (email, request.name.strip(), password_hash, "teacher", status, now))
-            row = db.execute("SELECT id,name,email,department,status,hashed_password,created_at FROM users WHERE email=?", (email,)).fetchone()
+            db.execute("INSERT INTO users(email,name,hashed_password,role,status,department,created_at) VALUES(?,?,?,?,?,?,?)",
+                       (email, request.name.strip(), password_hash, request.role, status, request.department, now))
+            row = db.execute("SELECT id,name,email,department,role,status,hashed_password,created_at FROM users WHERE email=?", (email,)).fetchone()
             if row is None or row["hashed_password"] != password_hash:
-                logger.error("Teacher creation stored-hash verification failed: email=%s user_id=%s", email, (row["id"] if row else None))
+                logger.error("User creation stored-hash verification failed: email=%s user_id=%s", email, (row["id"] if row else None))
                 raise HTTPException(status_code=500, detail="Password storage verification failed.")
-            logger.info("Teacher creation stored-hash verified: email=%s user_id=%s", email, row["id"])
     except HTTPException:
         raise
     except Exception as exc:
         if "UNIQUE" in str(exc): raise HTTPException(status_code=409, detail="Email already exists.") from exc
         raise
-    return _teacher({**dict(row), "subject_count": len(subjects), "subject_names": "|".join(subjects)})
+    return _teacher(dict(row), subjects)
 
 
 @app.patch("/teachers/{teacher_id}", tags=["teachers"])
+@app.patch("/users/{teacher_id}", tags=["users"])
 def update_teacher(teacher_id: int, changes: TeacherUpdate, _: AdminWrite) -> dict:
-    from src.masterdeorca.database import _password_hash
-    allowed = {"name", "email", "department", "status", "password", "subjects"}
+    allowed = {"name", "email", "department", "status", "password", "subjects", "role"}
     changes = changes.model_dump(exclude_unset=True)
     if not changes or set(changes) - allowed:
         raise HTTPException(status_code=422, detail="Provide valid teacher fields to update.")
@@ -1904,6 +2459,8 @@ def update_teacher(teacher_id: int, changes: TeacherUpdate, _: AdminWrite) -> di
         if "@" not in vals["email"]: raise HTTPException(status_code=422, detail="Invalid email.")
     if "status" in vals and vals["status"] is None:
         raise HTTPException(status_code=422, detail="status must be 'authorized' or 'unauthorized'.")
+    if vals.get("role", ...) is None:
+        vals.pop("role", None)
     password_changed = False
     new_pw_for_verify = None
     if "password" in vals:
@@ -1920,13 +2477,23 @@ def update_teacher(teacher_id: int, changes: TeacherUpdate, _: AdminWrite) -> di
             password_changed = True
             new_pw_for_verify = new_pw
     if "name" in vals and not str(vals["name"]).strip(): raise HTTPException(status_code=422, detail="Name cannot be empty.")
-    cols = {"name", "email", "status", "hashed_password"}
+    cols = {"name", "email", "status", "hashed_password", "role"}
     updates = {key: value for key, value in vals.items() if key in cols}
 
     def _do_update():
         with database.connect() as db:
-            old = db.execute("SELECT * FROM users WHERE id=? AND role='teacher'", (teacher_id,)).fetchone()
-            if not old: raise HTTPException(status_code=404, detail="Teacher not found")
+            old = db.execute("SELECT * FROM users WHERE id=?", (teacher_id,)).fetchone()
+            if not old: raise HTTPException(status_code=404, detail="User not found")
+            old_role = normalize_stored_role(old["role"])
+            old_active = old["status"] in {"active", "approved", "authorized"}
+            new_role = vals.get("role", old_role)
+            new_status = vals.get("status", old["status"])
+            new_active = new_status in {"active", "approved", "authorized"}
+            if old_role == ADMIN_ROLE and old_active and (new_role != ADMIN_ROLE or not new_active):
+                active_admins = db.execute("""SELECT count(*) FROM users
+                    WHERE LOWER(TRIM(role))='admin' AND status IN ('active','approved','authorized')""").fetchone()[0]
+                if active_admins <= 1:
+                    raise HTTPException(status_code=409, detail="The last active administrator cannot be demoted or disabled.")
             try:
                 if updates:
                     db.execute("UPDATE users SET " + ",".join(f"{key}=?" for key in updates) + " WHERE id=?", [*updates.values(), teacher_id])
@@ -1964,9 +2531,9 @@ def update_teacher(teacher_id: int, changes: TeacherUpdate, _: AdminWrite) -> di
                     pass
                 if "UNIQUE" in str(exc): raise HTTPException(status_code=409, detail="Email already exists.") from exc
                 raise
-            row = db.execute("SELECT id,name,email,department,status,created_at FROM users WHERE id=? AND role='teacher'", (teacher_id,)).fetchone()
+            row = db.execute("SELECT id,name,email,department,role,status,created_at FROM users WHERE id=?", (teacher_id,)).fetchone()
             if row is None:
-                raise HTTPException(status_code=404, detail="Teacher not found")
+                raise HTTPException(status_code=404, detail="User not found")
             return row
     row = database._retry_db(_do_update)
     if subjects is not None:
@@ -1990,21 +2557,36 @@ def remove_teacher(teacher_id: int, _: AdminWrite):
 
 @app.get("/teachers/me/subjects", tags=["teachers"])
 def list_my_teacher_subjects(email: Annotated[str, Depends(require_user)]) -> dict:
-    """Return the authenticated teacher's assigned subjects, never a client-selected user's."""
+    """Return canonical assigned subjects for the authenticated teacher."""
     user = database.get_user_by_email(email)
-    if not user or user.get("role") != "teacher":
-        raise HTTPException(status_code=403, detail="Teacher role required")
-    subjects = database.get_user_subjects(user["id"])
-    if not subjects:
-        # Preserve visibility of explicit legacy assignments while returning
-        # no subjects for teachers who have no assignment rows in either store.
-        subjects = [
-            {"subject_name": name, "can_view_papers": None,
-             "can_upload_process": None, "can_manage_question_bank": None,
-             "can_generate_papers": None}
-            for name in database.get_teacher_subjects(email)
-        ]
-    return {"teacher_id": user["id"], "subjects": subjects}
+    if not user:
+        raise HTTPException(status_code=401, detail="Authenticated user no longer exists")
+    role = normalize_stored_role(user.get("role"))
+    if role == ADMIN_ROLE:
+        raise HTTPException(status_code=403, detail="Administrators should use GET /subjects")
+    elif role == TEACHER_ROLE:
+        # TEACHER_SUBJECTS.teacher_id explicitly references USERS.id.
+        # Empty assignments are valid and return an empty array.
+        resolution = database.get_teacher_subject_resolution_by_id(user["id"])
+    else:
+        raise HTTPException(status_code=403, detail="This account cannot view teacher subject assignments")
+    subjects = []
+    for record in resolution["subjects"]:
+        subject_id, subject_name = record["subject_id"], record["subject_name"]
+        subjects.append({
+            **record,
+            "id": subject_id,
+            "name": subject_name,
+            "subject_id": subject_id,
+            "subject_name": subject_name,
+            "can_view_papers": None,
+            "can_upload_process": None,
+            "can_manage_question_bank": None,
+            "can_generate_papers": None,
+        })
+    return {"teacher_id": user["id"], "subjects": subjects,
+            "subject_records": subjects,
+            "unmapped_subjects": resolution["unmapped_subjects"]}
 
 
 @app.get("/teachers/{teacher_id}/subjects", tags=["teachers"])
@@ -2012,15 +2594,11 @@ def list_teacher_subjects(teacher_id: int, _: Admin) -> dict:
     teacher = database.get_teacher_by_id(teacher_id)
     if not teacher:
         raise HTTPException(status_code=404, detail="Teacher not found")
-    subjects = database.get_user_subjects(teacher_id)
-    if not subjects:
-        # Fall back to legacy assignments without inventing permission values.
-        subjects = [
-            {"subject_name": name, "can_view_papers": None,
-             "can_upload_process": None, "can_manage_question_bank": None,
-             "can_generate_papers": None}
-            for name in database.get_teacher_subjects(teacher["email"])
-        ]
+    subjects = [
+        {**record, "can_view_papers": None, "can_upload_process": None,
+         "can_manage_question_bank": None, "can_generate_papers": None}
+        for record in database.get_teacher_subject_records_by_id(teacher_id)
+    ]
     return {"teacher_id": teacher_id, "subjects": subjects}
 
 
@@ -2034,11 +2612,11 @@ def assign_teacher_subjects(teacher_id: int, request: TeacherSubjectAssign, _: A
     if request.subjects is not None:
         subjects = _validated_subjects(request.subjects)
     else:
-        subjects = database.get_teacher_subjects(teacher["email"])
+        subjects = database.get_teacher_subject_names_by_id(teacher_id)
         if request.subject not in subjects:
             subjects = _validated_subjects([*subjects, request.subject])
     database.set_teacher_subjects(teacher_id, subjects)
-    return {"teacher_id": teacher_id, "subjects": database.get_teacher_subjects(teacher["email"])}
+    return {"teacher_id": teacher_id, "subjects": database.get_teacher_subject_names_by_id(teacher_id)}
 
 
 @app.delete("/teachers/{teacher_id}/subjects/{subject}", status_code=204, tags=["teachers"])
