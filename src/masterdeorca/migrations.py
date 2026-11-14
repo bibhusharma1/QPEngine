@@ -514,6 +514,11 @@ def _migrate_smart_qpg(db) -> None:
         pass
 
 
+def _migrate_smart_qpg_docx_status(db) -> None:
+    """Persist DOCX export failures separately from question-generation errors."""
+    add_column_if_missing(db, "question_generation_jobs", "docx_error", "TEXT")
+
+
 def _migrate_syllabus_upload_status(db) -> None:
     """Track syllabus labels and background PDF processing state."""
     add_column_if_missing(db, "syllabi", "syllabus_name", "TEXT")
@@ -671,6 +676,7 @@ MIGRATIONS: tuple[tuple[str, object], ...] = (
     ("smart_qpg_syllabus_processing_retries_v1", _migrate_syllabus_processing_retries),
     ("smart_qpg_generation_item_source_refs_v1", _migrate_generation_item_source_refs),
     ("canonical_user_roles_v1", _migrate_canonical_user_roles),
+    ("smart_qpg_generation_docx_status_v1", _migrate_smart_qpg_docx_status),
 )
 
 

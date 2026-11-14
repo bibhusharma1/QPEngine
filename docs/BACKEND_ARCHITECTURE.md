@@ -220,11 +220,11 @@ Key resolved settings:
 | `DEFAULT_SUBJECT` | `QUES_DEFAULT_SUBJECT` | `OperatingSys` |
 | `MAX_UPLOAD_BYTES` | `QUES_MAX_UPLOAD_MB` | `50` (MiB) |
 | `API_PORT` | `QUES_PORT` | `8000` |
-| `DATABASE_BACKEND` | `DATABASE_BACKEND` | `turso` (required) |
+| `DATABASE_BACKEND` | `DATABASE_BACKEND` | Turso on Render; SQLite only with `APP_ENV=local` |
 | `TURSO_DATABASE_URL` | `TURSO_DATABASE_URL` | required; database `qp`, org `bibhusharma1` |
 | `TURSO_AUTH_TOKEN` | `TURSO_AUTH_TOKEN` | required |
 | `JWT_SECRET` / `JWT_TTL_MINUTES` | `QUES_JWT_SECRET` / `QUES_JWT_TTL_MINUTES` | `""` (must be set) / `480` |
-| `ADMIN_EMAIL` / `ADMIN_PASSWORD` | `QUES_ADMIN_EMAIL` / `QUES_ADMIN_PASSWORD` | `admin@example.com` / `admin123` |
+| `ADMIN_EMAIL` / `ADMIN_PASSWORD` | `QUES_ADMIN_EMAIL` / `QUES_ADMIN_PASSWORD` | explicit environment configuration; no default account |
 | `CORS_ORIGINS` | `QUES_CORS_ORIGINS` | `http://localhost:3000,http://127.0.0.1:3000,http://localhost:5173,http://127.0.0.1:5173` |
 | `PARSER_MODE` | `PARSER_MODE` | `llm` |
 | `NVIDIA_PARSE_MODEL` | `NVIDIA_PARSE_MODEL` | `nvidia/nemotron-3.5-parse` |

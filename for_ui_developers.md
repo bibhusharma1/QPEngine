@@ -9,11 +9,11 @@
 
 ## Start and authenticate
 
-Copy `.env.example` to `.env`, set a private `QUES_JWT_SECRET`, change the development admin password, then run `docker compose up --build`. The local base URL is `http://localhost:8000`; interactive OpenAPI docs are at `/docs`.
+For isolated development, configure an untracked `.env` with `APP_ENV=local`, `DATABASE_BACKEND=sqlite`, local `DATABASE_PATH` and `QUES_STORAGE_ROOT` paths, a private `QUES_JWT_SECRET`, and explicit `QUES_ADMIN_EMAIL` / `QUES_ADMIN_PASSWORD` values. Run `python scripts/create_local_admin.py` to provision the first local administrator, then start the API. There is no default account. The local base URL is `http://localhost:8000`; interactive OpenAPI docs are at `/docs`.
 
 The default `QUES_CORS_ORIGINS` allows `http://localhost:3000`, `http://localhost:5173`, and `http://127.0.0.1:5173`. Keep the frontend's exact origin in this comma-separated setting; `localhost` and `127.0.0.1` are distinct origins.
 
-Login with `POST /auth/login` and JSON `{ "email": "admin@example.com", "password": "admin123" }`. A successful response contains `access_token` and `token_type: "bearer"`. Send `Authorization: Bearer <access_token>` on every endpoint below. The token expires after `QUES_JWT_TTL_MINUTES`.
+Login with `POST /auth/login` and JSON containing the configured account email and password. A successful response contains `access_token` and `token_type: "bearer"`. Send `Authorization: Bearer <access_token>` on every protected endpoint below. The token expires after `QUES_JWT_TTL_MINUTES`.
 
 Success response: `{ "access_token": "<JWT>", "token_type": "bearer" }`. Invalid credentials return 401.
 
@@ -21,7 +21,7 @@ Success response: `{ "access_token": "<JWT>", "token_type": "bearer" }`. Invalid
 const base = "http://localhost:8000";
 const login = await fetch(`${base}/auth/login`, {
   method: "POST", headers: { "Content-Type": "application/json" },
-  body: JSON.stringify({ email: "admin@example.com", password: "admin123" })
+  body: JSON.stringify({ email: configuredEmail, password: configuredPassword })
 });
 const { access_token } = await login.json();
 const headers = { Authorization: `Bearer ${access_token}` };
@@ -41,7 +41,7 @@ Example responses: `GET /subjects` → `{ "subjects": ["OperatingSys"] }`; `POST
 const subjects = await fetch(`${base}/subjects`, { headers });
 const created = await fetch(`${base}/subjects`, {
   method: "POST", headers: { ...headers, "Content-Type": "application/json" },
-  body: JSON.stringify({ name: "NewSubject" })
+  body: JSON.stringify({ email: configuredEmail, password: configuredPassword })
 });
 ```
 
@@ -150,7 +150,7 @@ const pdfs = await fetch(`${base}/subjects/OperatingSys/pdfs`, { headers });
 ```js
 const started = await fetch(`${base}/subjects/OperatingSys/pdfs/paper.pdf/process`, {
   method: "POST", headers: { ...headers, "Content-Type": "application/json" },
-  body: JSON.stringify({ force: true })
+  body: JSON.stringify({ email: configuredEmail, password: configuredPassword })
 });
 const { job_id } = await started.json();
 ```
@@ -238,7 +238,7 @@ Create a draft from real questions with the same body as the generation request:
 const response = await fetch(`${base}/api/question-papers/drafts`, {
   method: "POST",
   headers: { ...headers, "Content-Type": "application/json" },
-  body: JSON.stringify({
+  body: JSON.stringify({ email: configuredEmail, password: configuredPassword })
     paper_title: "Operating Systems Final",
     subject: "OperatingSys",
     exam_type: "Final",
@@ -309,7 +309,7 @@ subject bank used by Question Bank reads and paper generation:
 const created = await fetch(`${base}/api/question-bank`, {
   method: "POST",
   headers: { ...headers, "Content-Type": "application/json" },
-  body: JSON.stringify({
+  body: JSON.stringify({ email: configuredEmail, password: configuredPassword })
     subject_id: "OperatingSys",
     text: "Explain process scheduling.",
     marks: 5,
@@ -326,7 +326,7 @@ const question = await created.json();
 await fetch(`${base}/api/question-bank/${encodeURIComponent(question.question_id)}?subject_id=OperatingSys`, {
   method: "PATCH",
   headers: { ...headers, "Content-Type": "application/json" },
-  body: JSON.stringify({ text: "Updated wording.", marks: 4 })
+  body: JSON.stringify({ email: configuredEmail, password: configuredPassword })
 });
 ```
 

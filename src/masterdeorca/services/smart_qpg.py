@@ -11,6 +11,7 @@ import random
 import re
 import threading
 import tempfile
+import time
 import uuid
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
@@ -203,6 +204,7 @@ class SyllabusSection(BaseModel):
     model_config = ConfigDict(extra="ignore")
     heading: str
     topics: list[str] = Field(default_factory=list)
+    topic_details: list[dict] = Field(default_factory=list)
 
 
 class SyllabusModule(BaseModel):
@@ -251,7 +253,69 @@ def _nvidia_client():
     key = settings.setting("NVIDIA_API_KEY", "") or settings.setting("NVIDIA_API", "")
     if not key:
         raise RuntimeError("NVIDIA_API_KEY is not configured.")
-    return AsyncOpenAI(api_key=key, base_url=settings.QUESTION_GENERATION_BASE_URL, timeout=180)
+    # Retries are handled below so attempt counts, backoff, and errors remain visible.
+    return AsyncOpenAI(api_key=key, base_url=settings.QUESTION_GENERATION_BASE_URL,
+                       timeout=settings.QUESTION_GENERATION_TIMEOUT, max_retries=0)
+
+
+def _generation_event(event: str, **fields) -> None:
+    """Emit structured diagnostics without prompt or credential contents."""
+    logger.info("smart_qpg %s", _safe_json({"event": event, "timestamp": now(), **fields}))
+
+
+def _model_event(event: str, *, job_id: str | None, item_id: str | None, **fields) -> None:
+    if job_id is not None or item_id is not None:
+        _generation_event(event, job_id=job_id, item_id=item_id, **fields)
+
+
+class _InvalidModelOutput(ValueError):
+    pass
+
+
+class _GenerationRequestError(RuntimeError):
+    def __init__(self, category: str, message: str, *, retryable: bool, status_code: int | None = None,
+                 retry_after: float | None = None):
+        super().__init__(message)
+        self.category = category
+        self.retryable = retryable
+        self.status_code = status_code
+        self.retry_after = retry_after
+
+
+def _generation_error_detail(exc: Exception) -> str:
+    if isinstance(exc, ValidationError):
+        return "; ".join(f"{'.'.join(str(part) for part in error['loc'])}: {error['msg']}"
+                          for error in exc.errors(include_input=False, include_context=False))[:500]
+    if isinstance(exc, _InvalidModelOutput):
+        return str(exc)[:300]
+    if isinstance(exc, _GenerationRequestError):
+        return str(exc)[:400]
+    return f"{type(exc).__name__} (status={getattr(exc, 'status_code', None)})"
+
+
+def _request_failure(exc: Exception) -> _GenerationRequestError:
+    status = getattr(exc, "status_code", None)
+    response = getattr(exc, "response", None)
+    headers = getattr(response, "headers", {}) or {}
+    try:
+        retry_after = min(8.0, max(0.0, float(headers.get("retry-after"))))
+    except (TypeError, ValueError):
+        retry_after = None
+    name = type(exc).__name__
+    if status == 429:
+        category, retryable = "rate_limit", True
+    elif status in {408, 504} or name in {"APITimeoutError", "TimeoutError", "ReadTimeout", "WriteTimeout", "PoolTimeout"}:
+        category, retryable = "timeout", True
+    elif name in {"APIConnectionError", "ConnectError", "ConnectionError", "ConnectionResetError"}:
+        category, retryable = "network_error", True
+    elif isinstance(status, int) and status >= 500:
+        category, retryable = "server_error", True
+    elif status is not None and 400 <= status < 500:
+        category, retryable = "permanent_request_error", False
+    else:
+        category, retryable = "request_error", False
+    return _GenerationRequestError(category, f"{name}: {str(exc)[:350]}", retryable=retryable,
+                                   status_code=status, retry_after=retry_after)
 
 
 def _extract_json_object(content: str) -> dict:
@@ -273,9 +337,18 @@ def _extract_json_object(content: str) -> dict:
 
 async def _chat(client, system: str, payload: dict, *, max_tokens: int | None = None,
                 model: str | None = None, temperature: float | None = None,
-                enable_thinking: bool | None = None) -> dict:
-    last_error = None
-    for attempt in range(3):
+                enable_thinking: bool | None = None, job_id: str | None = None,
+                item_id: str | None = None, diagnostics: dict | None = None) -> dict:
+    attempt = 1
+    while True:
+        request_attempt = int((diagnostics or {}).get("generation_attempt", 1))
+        started_at, started = now(), time.perf_counter()
+        parse_started = None
+        response_duration = None
+        if diagnostics is not None:
+            diagnostics["http_attempts"] = diagnostics.get("http_attempts", 0) + 1
+        _model_event("model_request_started", job_id=job_id, item_id=item_id,
+                     attempt=request_attempt, timestamp=started_at, model=model or settings.QUESTION_GENERATION_MODEL)
         try:
             response = await client.chat.completions.create(
                 model=model or settings.QUESTION_GENERATION_MODEL,
@@ -287,9 +360,16 @@ async def _chat(client, system: str, payload: dict, *, max_tokens: int | None = 
                 extra_body={"chat_template_kwargs": {"enable_thinking": (
                     settings.QUESTION_GENERATION_ENABLE_THINKING if enable_thinking is None else enable_thinking)}},
             )
+            response_duration = time.perf_counter() - started
+            parse_started = time.perf_counter()
+            usage = getattr(response, "usage", None)
+            if diagnostics is not None and usage is not None:
+                diagnostics["prompt_tokens"] = getattr(usage, "prompt_tokens", None)
+                diagnostics["completion_tokens"] = getattr(usage, "completion_tokens", None)
+                diagnostics["total_tokens"] = getattr(usage, "total_tokens", None)
             choices = getattr(response, "choices", None) or []
             if not choices:
-                raise ValueError("NVIDIA response contained no choices")
+                raise _InvalidModelOutput("NVIDIA response contained no choices")
             choice = choices[0]
             finish_reason = getattr(choice, "finish_reason", None)
             message = getattr(choice, "message", None)
@@ -297,19 +377,40 @@ async def _chat(client, system: str, payload: dict, *, max_tokens: int | None = 
             if isinstance(content, list):
                 content = "\n".join(str(getattr(part, "text", "") or "") for part in content)
             if finish_reason == "length":
-                raise ValueError("NVIDIA response was truncated (finish_reason=length)")
-            return _extract_json_object(content)
+                raise _InvalidModelOutput("NVIDIA response was truncated (finish_reason=length)")
+            try:
+                parsed = _extract_json_object(content)
+            except ValueError as exc:
+                raise _InvalidModelOutput(str(exc)) from exc
+            parse_duration = time.perf_counter() - parse_started
+            if diagnostics is not None:
+                diagnostics["response_duration_seconds"] = response_duration
+                diagnostics["response_parse_duration_seconds"] = parse_duration
+            _model_event("model_response_parsed", job_id=job_id, item_id=item_id, attempt=request_attempt,
+                         timestamp=now(), http_attempts=diagnostics.get("http_attempts") if diagnostics else attempt,
+                         response_duration_seconds=round(response_duration, 3),
+                         parse_validation_duration_seconds=round(parse_duration, 3))
+            return parsed
+        except _InvalidModelOutput as exc:
+            duration = time.perf_counter() - started
+            if diagnostics is not None:
+                diagnostics["response_duration_seconds"] = response_duration if response_duration is not None else duration
+                if parse_started is not None:
+                    diagnostics["response_parse_duration_seconds"] = time.perf_counter() - parse_started
+            _model_event("model_output_invalid", job_id=job_id, item_id=item_id, attempt=request_attempt,
+                         http_attempts=diagnostics.get("http_attempts") if diagnostics else attempt,
+                         response_duration_seconds=round(response_duration if response_duration is not None else duration, 3),
+                         parse_duration_seconds=round(time.perf_counter() - parse_started, 3) if parse_started else None,
+                         reason=str(exc)[:300])
+            raise
         except Exception as exc:
-            status = getattr(exc, "status_code", None)
-            if status is not None and status != 429 and status < 500:
-                raise
-            # Do not repeat a model call just because its output used simple
-            # schema variations or was malformed; normalize/validate once below.
-            if isinstance(exc, ValueError):
-                raise
-            if attempt == 2:
-                raise
-            await asyncio.sleep(min(2 ** attempt, 8))
+            failure = _request_failure(exc)
+            duration = time.perf_counter() - started
+            _model_event("model_request_failed", job_id=job_id, item_id=item_id, attempt=request_attempt,
+                             http_attempts=diagnostics.get("http_attempts") if diagnostics else attempt,
+                             duration_seconds=round(duration, 3), status_code=failure.status_code,
+                             exception=type(exc).__name__, category=failure.category, retryable=failure.retryable)
+            raise failure from exc
 
 
 def _clean_extracted_text(text: str) -> str:
@@ -407,14 +508,26 @@ def _normalize_structure_payload(value: dict, subject_name: str) -> dict:
                 continue
             raw_topics = raw_section.get("topics") or raw_section.get("subtopics") or []
             topics = []
+            topic_details = []
+            raw_details = raw_section.get("topic_details") or []
+            details_by_name = {
+                str(detail.get("topic") or detail.get("name") or "").strip().casefold(): detail
+                for detail in raw_details if isinstance(detail, dict)
+            } if isinstance(raw_details, list) else {}
             for topic in raw_topics if isinstance(raw_topics, list) else []:
                 if isinstance(topic, str) and topic.strip():
-                    topics.append(topic.strip())
+                    label = topic.strip()
+                    topics.append(label)
+                    detail = details_by_name.get(label.casefold(), {})
+                    topic_details.append({**detail, "topic": label})
                 elif isinstance(topic, dict):
                     label = topic.get("topic") or topic.get("name") or topic.get("title")
                     if isinstance(label, str) and label.strip():
-                        topics.append(label.strip())
-            sections.append({"heading": str(heading).strip(), "topics": topics})
+                        label = label.strip()
+                        topics.append(label)
+                        topic_details.append({**topic, "topic": label})
+            sections.append({"heading": str(heading).strip(), "topics": topics,
+                             "topic_details": topic_details})
         modules.append({"module_name": str(name).strip(), "hours": hours, "sections": sections})
     def text_list(*keys: str) -> list[str]:
         candidate = next((value.get(key) for key in keys if value.get(key) is not None), [])
@@ -551,16 +664,100 @@ def _render_summary_text(value: str) -> str:
         _normalize_structure_payload(candidate, str(record.get("subject") or candidate.get("subject") or "")))
     if not structured.modules:
         return value
-    lines = [structured.subject]
-    for module in structured.modules:
-        module_label = module.module_name
-        if module.hours is not None:
-            module_label += f" ({module.hours} hours)"
+    return _render_summary_data(structured.model_dump())
+
+
+def _render_summary_data(summary: dict) -> str:
+    lines = [str(summary.get("subject") or "")]
+    for module in summary.get("modules") or []:
+        if isinstance(module, dict):
+            module_label = str(module.get("module_name") or "")
+            hours = module.get("hours")
+            sections = module.get("sections") or []
+        else:
+            hours = getattr(module, "hours", None)
+            sections = getattr(module, "sections", [])
+        if hours is not None:
+            module_label += f" ({hours} hours)"
         lines.append(f"\n{module_label}")
-        for section in module.sections:
-            lines.append(f"  {section.heading}")
-            lines.extend(f"    - {topic}" for topic in section.topics)
+        for section in sections:
+            heading = section.get("heading", "") if isinstance(section, dict) else section.heading
+            topics = section.get("topics", []) if isinstance(section, dict) else section.topics
+            lines.append(f"  {heading}")
+            lines.extend(f"    - {topic}" for topic in topics)
     return "\n".join(lines).strip()
+
+
+def validate_submitted_summary(submitted: dict | str, syllabus: dict) -> None:
+    """Reject a frontend summary that does not match the selected stored syllabus."""
+    stored = syllabus.get("summary_data")
+    if not isinstance(stored, dict) or not isinstance(stored.get("modules"), list):
+        raise ValueError("The selected syllabus has no validated structured summary.")
+    subject_name = str(syllabus.get("subject_name") or stored.get("subject") or "")
+    if isinstance(submitted, str):
+        supplied_text = " ".join(submitted.split())
+        stored_text = " ".join(_render_summary_data(stored).split())
+        if supplied_text != stored_text:
+            raise ValueError("Submitted syllabus summary does not match the selected syllabus.")
+        return
+    if not isinstance(submitted, dict):
+        raise ValueError("Syllabus summary must be structured data or summary text.")
+    for key in ("summary_data", "syllabus_summary", "summary"):
+        nested = submitted.get(key)
+        if isinstance(nested, dict):
+            submitted = nested
+            break
+    try:
+        normalized = SyllabusSummary.model_validate(
+            _normalize_structure_payload(submitted, subject_name)
+        ).model_dump()
+    except (TypeError, ValueError, ValidationError) as exc:
+        raise ValueError("Submitted syllabus summary is not a valid structured syllabus.") from exc
+    stored_normalized = SyllabusSummary.model_validate(
+        _normalize_structure_payload(stored, subject_name)
+    ).model_dump()
+    if (normalized.get("subject", "").casefold() != stored_normalized.get("subject", "").casefold()
+            or normalized.get("modules") != stored_normalized.get("modules")):
+        raise ValueError("Submitted syllabus summary does not match the selected syllabus.")
+
+
+def _scope_key(item: dict) -> str:
+    return "\x1f".join(str(item.get(key) or "").casefold() for key in
+                        ("module_name", "heading", "topic"))
+
+
+def _scope_hierarchy(scope: list[dict]) -> list[dict]:
+    modules: list[dict] = []
+    module_index: dict[str, dict] = {}
+    section_index: dict[tuple[str, str], dict] = {}
+    for entry in scope:
+        module_name = str(entry.get("module_name") or "").strip()
+        heading = str(entry.get("heading") or "").strip()
+        module_key = module_name.casefold()
+        module = module_index.get(module_key)
+        if module is None:
+            module = {"module_name": module_name, "sections": []}
+            module_index[module_key] = module
+            modules.append(module)
+        section_key = (module_key, heading.casefold())
+        section = section_index.get(section_key)
+        if section is None:
+            section = {"heading": heading, "topics": []}
+            section_index[section_key] = section
+            module["sections"].append(section)
+        topic = {"topic": entry.get("topic")}
+        if entry.get("description"):
+            topic["description"] = entry["description"]
+        section["topics"].append(topic)
+    return modules
+
+
+def _generation_request_identity(request: dict) -> str:
+    transient = {"syllabus_summary", "selected_modules", "selected_topics", "resolved_scope",
+                 "resolved_hierarchy", "resolved_guidance", "generation_context_id",
+                 "calculated_total_questions", "calculated_total_marks"}
+    stable = {key: value for key, value in request.items() if key not in transient}
+    return _safe_json({key: stable[key] for key in sorted(stable)})
 
 
 def _topic_generation_guidance(syllabus: dict, item: dict) -> dict:
@@ -596,14 +793,14 @@ def _merge_module_sections(module_name: str, hours: int | None, module_parts: li
                 sections[-1]["topics"].extend(section.get("topics", []))
             else:
                 sections.append({"heading": section["heading"], "topics": list(section.get("topics", []))})
-    for section in sections:
-        seen: set[str] = set()
-        section["topics"] = [topic for topic in section["topics"]
-                             if not (topic.casefold() in seen or seen.add(topic.casefold()))]
-        combined = re.match(r"^([A-Z][A-Z0-9 &,()/.-]{2,}?)\s+[–—-]\s*([A-Z][a-z].+)$", section["heading"])
-        if combined:
-            section["heading"] = combined.group(1).strip()
-            section["topics"].insert(0, combined.group(2).strip())
+        for section in sections:
+            seen: set[str] = set()
+            section["topics"] = [topic for topic in section["topics"]
+                                 if not (topic.casefold() in seen or seen.add(topic.casefold()))]
+            combined = re.match(r"^([A-Z][A-Z0-9 &,()/.-]{2,}?)\s+[–—-]\s*([A-Z][a-z].+)$", section["heading"])
+            if combined:
+                section["heading"] = combined.group(1).strip()
+                section["topics"].insert(0, combined.group(2).strip())
     return {"module_name": module_name, "hours": hours, "sections": sections}
 
 
@@ -1073,7 +1270,10 @@ def _run_syllabus_worker(syllabus_id: str) -> None:
 
 def get_syllabus(syllabus_id: str) -> dict | None:
     with database.connect() as db:
-        row = db.execute("""SELECT sy.*,s.subject_name AS subject_name
+        row = db.execute("""SELECT sy.id,sy.subject_id,sy.filename,sy.summary_text,sy.processing_status,
+                sy.processing_error,sy.syllabus_name,sy.academic_year,sy.version,sy.is_active,sy.uploaded_by,
+                sy.checksum_sha256,sy.created_at,sy.updated_at,LENGTH(sy.content_blob) AS size_bytes,
+                s.subject_name AS subject_name
             FROM syllabuses sy JOIN subjects s ON s.subject_id=sy.subject_id
             WHERE sy.id=?""", (syllabus_id,)).fetchone()
     if not row:
@@ -1084,8 +1284,6 @@ def get_syllabus(syllabus_id: str) -> dict | None:
     result["original_filename"] = result["filename"]
     result["status"] = result["processing_status"]
     result["created_by"] = result["uploaded_by"]
-    result["size_bytes"] = len(result["content_blob"] or b"")
-    result.pop("content_blob", None)
     raw_summary = str(result.get("summary_text") or "")
     try:
         summary_record = json.loads(raw_summary)
@@ -1096,7 +1294,9 @@ def get_syllabus(syllabus_id: str) -> dict | None:
     except (TypeError, ValueError, ValidationError):
         # Legacy plain-text summaries remain available through summary_text.
         pass
-    result["summary_text"] = _render_summary_text(raw_summary)
+    result["summary_text"] = (_render_summary_data(result["summary_data"])
+                              if isinstance(result.get("summary_data"), dict)
+                              else _render_summary_text(raw_summary))
     return result
 
 
@@ -1243,34 +1443,104 @@ def _topic_names(topics: list) -> set[str]:
 
 
 def _resolve_generation_scope(syllabus: dict, request: dict) -> list[dict]:
-    """Validate frontend selections against the stored structured syllabus."""
+    """Validate the hierarchy carried in `instructions` against stored data."""
     summary = syllabus.get("summary_data")
     if not isinstance(summary, dict) or not isinstance(summary.get("modules"), list):
         raise ValueError("This syllabus has no validated structured summary. Reprocess it before generating questions.")
     modules = [item for item in summary["modules"] if isinstance(item, dict)]
     by_name = {str(item.get("module_name") or "").strip().casefold(): item for item in modules}
-    selected_names = [str(name).strip() for name in request.get("selected_modules", []) if str(name).strip()]
-    requested_scope = request.get("selected_scope", []) or []
-    if requested_scope and not selected_names:
-        selected_names = list(dict.fromkeys(str(item.get("module_name") or "").strip()
-                                             for item in requested_scope if isinstance(item, dict)))
+    by_identifier = {str(item.get(key)).strip().casefold(): item for item in modules
+                     for key in ("module_id", "id") if item.get(key) not in (None, "")}
+
+    instructions = request.get("instructions")
+    instruction_data = instructions if isinstance(instructions, dict) else {}
+    hierarchy = next((instruction_data.get(key) for key in
+                      ("selected_hierarchy", "syllabus_selection", "selection")
+                      if isinstance(instruction_data.get(key), (dict, list))), None)
+    if hierarchy is None:
+        hierarchy = instruction_data
+    if isinstance(hierarchy, list):
+        hierarchy = {"modules": hierarchy}
+    elif isinstance(instructions, list) and any(isinstance(item, dict) for item in instructions):
+        hierarchy = {"modules": instructions}
+    elif not isinstance(hierarchy, dict):
+        hierarchy = {}
+    raw_modules = request.get("selected_modules") or next((hierarchy.get(key) for key in
+                        ("selected_modules", "modules", "module_selections")
+                        if isinstance(hierarchy.get(key), list)), [])
+    requested_scope: list[dict] = []
+    selected_names: list[str] = []
+    for raw_module in raw_modules:
+        if isinstance(raw_module, str):
+            module_name = raw_module.strip()
+            selected_names.append(module_name)
+            continue
+        if not isinstance(raw_module, dict):
+            raise ValueError("Each selected module in instructions must be a module name or hierarchy object.")
+        module_name = str(raw_module.get("module_name") or raw_module.get("name") or raw_module.get("module") or raw_module.get("module_id") or raw_module.get("id") or "").strip()
+        if module_name:
+            selected_names.append(module_name)
+        raw_sections = raw_module.get("sections", raw_module.get("selected_sections", []))
+        for raw_section in raw_sections if isinstance(raw_sections, list) else []:
+            if isinstance(raw_section, str):
+                requested_scope.append({"module_name": module_name, "heading": raw_section.strip(), "topic": ""})
+                continue
+            if not isinstance(raw_section, dict):
+                raise ValueError("Each selected section must be a section name or hierarchy object.")
+            heading = str(raw_section.get("heading") or raw_section.get("section") or raw_section.get("name") or "").strip()
+            topics = raw_section.get("topics", raw_section.get("selected_topics", []))
+            if not isinstance(topics, list):
+                raise ValueError("Selected section topics must be an array.")
+            if not topics:
+                requested_scope.append({"module_name": module_name, "heading": heading, "topic": ""})
+            for topic in topics:
+                if isinstance(topic, dict):
+                    topic = topic.get("topic") or topic.get("name") or topic.get("title")
+                if not isinstance(topic, str) or not topic.strip():
+                    raise ValueError("Selected topics in instructions must be non-empty names.")
+                requested_scope.append({"module_name": module_name, "heading": heading, "topic": topic.strip()})
     selected_topics = {str(topic).strip().casefold() for topic in request.get("selected_topics", [])
                        if str(topic).strip()}
-    if not selected_names and selected_topics:
-        selected_names = list(dict.fromkeys(
-            str(module.get("module_name") or "") for module in modules
-            if any(str(topic).strip().casefold() in selected_topics
-                   for section in module.get("sections", []) if isinstance(section, dict)
-                   for topic in section.get("topics", []))))
+    if not selected_names and not selected_topics:
+        # A syllabus selection is the generation scope by default. Explicit
+        # legacy selections remain understood by direct callers, but the API
+        # generation workflow passes no selection fields.
+        selected_names = [str(module.get("module_name") or "").strip() for module in modules
+                          if str(module.get("module_name") or "").strip()]
+    if not selected_names:
+        # Topic-only selection is safe only when each topic name identifies a
+        # single stored location. Ambiguous names must include hierarchy.
+        for topic in selected_topics:
+            locations = [(module, section, value)
+                         for module in modules
+                         for section in module.get("sections", []) if isinstance(section, dict)
+                         for value in section.get("topics", [])
+                         if str(value).strip().casefold() == topic]
+            if not locations:
+                raise ValueError(f"Selected topic does not exist in this syllabus: {topic}")
+            if len(locations) > 1:
+                raise ValueError(f"Selected topic {topic!r} is ambiguous; include its module and section in instructions.")
+            module, section, value = locations[0]
+            selected_names.append(str(module.get("module_name") or ""))
+            requested_scope.append({"module_name": str(module.get("module_name") or ""),
+                                    "heading": str(section.get("heading") or ""), "topic": str(value).strip()})
     if not selected_names:
         raise ValueError("Select at least one syllabus module and topic before generating questions.")
-    unknown = [name for name in selected_names if name.casefold() not in by_name]
+    selected_names = list(dict.fromkeys(selected_names))
+    resolved_names = []
+    unknown = []
+    for name in selected_names:
+        module = by_name.get(name.casefold()) or by_identifier.get(name.casefold())
+        if module:
+            resolved_names.append(str(module.get("module_name") or name).strip())
+        else:
+            unknown.append(name)
     if unknown:
-        raise ValueError(f"Selected syllabus module does not exist: {unknown[0]}")
-    allowed = {(str(item.get("module_name") or "").strip().casefold(),
-                str(item.get("heading") or "").strip().casefold(),
-                str(item.get("topic") or "").strip().casefold())
-               for item in requested_scope if isinstance(item, dict)}
+        raise ValueError(f"Selected syllabus module does not exist (name or ID): {unknown[0]}")
+    selected_names = list(dict.fromkeys(resolved_names))
+    # An explicitly selected module means all of its topics unless section or
+    # topic leaves narrow it. selected_topics always narrows by name.
+    has_leaf_selection = bool(requested_scope)
     result = []
     for module_name in selected_names:
         module = by_name[module_name.casefold()]
@@ -1278,6 +1548,10 @@ def _resolve_generation_scope(syllabus: dict, request: dict) -> list[dict]:
             if not isinstance(section, dict):
                 continue
             heading = str(section.get("heading") or "").strip()
+            detail_by_topic = {
+                str(detail.get("topic") or detail.get("name") or "").strip().casefold(): detail
+                for detail in section.get("topic_details", []) if isinstance(detail, dict)
+            }
             for topic in section.get("topics", []):
                 topic = str(topic).strip()
                 if not heading or not topic:
@@ -1285,14 +1559,34 @@ def _resolve_generation_scope(syllabus: dict, request: dict) -> list[dict]:
                 identity = (module_name.casefold(), heading.casefold(), topic.casefold())
                 if selected_topics and topic.casefold() not in selected_topics:
                     continue
-                if allowed and identity not in allowed:
+                if has_leaf_selection and not any(
+                    selected_module == identity[0]
+                    and (not selected_heading or selected_heading == identity[1])
+                    and (not selected_topic or selected_topic == identity[2])
+                    for selected_module, selected_heading, selected_topic in
+                    ((str(item.get("module_name") or "").strip().casefold(),
+                      str(item.get("heading") or "").strip().casefold(),
+                      str(item.get("topic") or "").strip().casefold())
+                     for item in requested_scope if isinstance(item, dict))):
                     continue
-                result.append({"module_name": str(module.get("module_name") or module_name),
-                               "heading": heading, "topic": topic})
-    if allowed:
-        valid = {(item["module_name"].casefold(), item["heading"].casefold(), item["topic"].casefold())
-                 for item in result}
-        if not allowed.issubset(valid):
+                resolved = {"module_name": str(module.get("module_name") or module_name),
+                            "heading": heading, "topic": topic}
+                detail = detail_by_topic.get(topic.casefold(), {})
+                description = (detail.get("description") or detail.get("topic_description")
+                               or detail.get("details") or detail.get("content"))
+                if description:
+                    resolved["description"] = description
+                result.append(resolved)
+    for item in requested_scope:
+        module_key = str(item.get("module_name") or "").strip().casefold()
+        section_key = str(item.get("heading") or "").strip().casefold()
+        topic_key = str(item.get("topic") or "").strip().casefold()
+        module = by_name.get(module_key)
+        section = next((section for section in module.get("sections", []) if isinstance(section, dict)
+                        and str(section.get("heading") or "").strip().casefold() == section_key), None) if module else None
+        if not module or not section:
+            raise ValueError("A selected section does not belong to its stated module in this syllabus.")
+        if topic_key and not any(str(topic).strip().casefold() == topic_key for topic in section.get("topics", [])):
             raise ValueError("A selected topic does not belong to its stated module and section in this syllabus.")
     if selected_topics:
         found_topics = {item["topic"].casefold() for item in result}
@@ -1306,8 +1600,9 @@ def _resolve_generation_scope(syllabus: dict, request: dict) -> list[dict]:
     return result
 
 
-def create_job(*, user: str, subject_id: str, syllabus_id: str, request: dict) -> str:
-    syllabus = get_syllabus(syllabus_id)
+def create_job(*, user: str, subject_id: str, syllabus_id: str, request: dict,
+               syllabus_record: dict | None = None) -> str:
+    syllabus = syllabus_record if syllabus_record is not None else get_syllabus(syllabus_id)
     if not syllabus or syllabus["subject_id"] != subject_id:
         raise ValueError("Syllabus does not belong to the selected subject.")
     if syllabus.get("status") != "completed":
@@ -1321,9 +1616,28 @@ def create_job(*, user: str, subject_id: str, syllabus_id: str, request: dict) -
         raise ValueError("Section names must be non-empty and unique.")
     if any(not str(section.get(key, "")).strip() for section in sections for key in ("question_type", "difficulty")):
         raise ValueError("Each section needs a question type and difficulty.")
-    scope = _resolve_generation_scope(syllabus, request)
+    # Full-syllabus generation is the default; legacy frontend selection fields
+    # must not silently narrow coverage.
+    scope = _resolve_generation_scope(syllabus, {})
     request["resolved_scope"] = scope
-    request["generation_context_id"] = uuid.uuid4().hex
+    request["resolved_hierarchy"] = _scope_hierarchy(scope)
+    request["resolved_guidance"] = {
+        _scope_key(item): _topic_generation_guidance(syllabus, item) for item in scope
+    }
+    raw_instructions = request.get("instructions")
+    general = []
+    if isinstance(raw_instructions, str):
+        general = [line.strip() for line in raw_instructions.splitlines() if line.strip()]
+    elif isinstance(raw_instructions, list):
+        general = [str(line).strip() for line in raw_instructions if isinstance(line, str) and line.strip()]
+    elif isinstance(raw_instructions, dict):
+        for key in ("general_instructions", "general", "examination_instructions", "text"):
+            value = raw_instructions.get(key)
+            if isinstance(value, str) and value.strip():
+                general.append(value.strip())
+            elif isinstance(value, list):
+                general.extend(str(line).strip() for line in value if isinstance(line, str) and line.strip())
+    request["instructions"] = general
     total_count = sum(int(section["question_count"]) for section in sections)
     total_marks = sum(int(section["question_count"]) * int(section["marks_per_question"]) for section in sections)
     requested_marks = request.get("total_marks")
@@ -1332,23 +1646,34 @@ def create_job(*, user: str, subject_id: str, syllabus_id: str, request: dict) -
     if total_count < 1 or total_count > 300: raise ValueError("Total requested questions must be between 1 and 300.")
     request["calculated_total_questions"] = total_count
     request["calculated_total_marks"] = total_marks
+    request_identity = _generation_request_identity(request)
+    request["generation_context_id"] = uuid.uuid4().hex
     job_id, stamp = uuid.uuid4().hex, now()
-    for section in sections:
-        section_topic = str(section.get("topic") or "").strip()
-        if section_topic and not any(item["topic"].casefold() == section_topic.casefold() for item in scope):
-            raise ValueError(f"Topic {section_topic!r} is not selected in the validated syllabus scope.")
     position = 0
     with database.connect() as db:
+        active_result = db.execute("""SELECT job_id,request_json FROM question_generation_jobs
+            WHERE created_by=? AND subject_id=? AND syllabus_id=? AND status IN ('queued','running')
+            ORDER BY created_at DESC""", (user, subject_id, syllabus_id))
+        active_jobs = active_result.fetchall() if hasattr(active_result, "fetchall") else []
+        for active in active_jobs:
+            try:
+                if _generation_request_identity(json.loads(active["request_json"])) == request_identity:
+                    return str(active["job_id"])
+            except (TypeError, ValueError, KeyError):
+                continue
         db.execute("""INSERT INTO question_generation_jobs(job_id,created_by,subject_id,syllabus_id,status,
             request_json,progress_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)""",
             (job_id,user,subject_id,syllabus_id,"queued",_safe_json(request),"{}",stamp,stamp))
         for section in sections:
-            section_topic = str(section.get("topic") or "")
-            topics = [item for item in scope if not section_topic or item["topic"].casefold() == section_topic.casefold()]
+            topics = scope
             if not topics:
                 raise ValueError(f"Section {section['name']!r} has no selected syllabus topics.")
-            for index in range(int(section["question_count"])):
-                source = topics[index % len(topics)]
+            question_count = int(section["question_count"])
+            for _index in range(question_count):
+                # Distribute questions across the whole paper so separate
+                # exam sections do not all restart at the same syllabus topic.
+                source_index = min(len(topics) - 1, ((2 * position + 1) * len(topics)) // (2 * total_count))
+                source = topics[source_index]
                 db.execute("""INSERT INTO question_generation_items(item_id,job_id,section,topic,marks,type,difficulty,
                     source_module,source_heading,position,status,created_at,updated_at)
                     VALUES(?,?,?,?,?,?,?,?,?,?,'queued',?,?)""",
@@ -1362,21 +1687,50 @@ def _update_progress(job_id: str, *, status: str | None = None, error: str | Non
     stamp = now()
     with database.connect() as db:
         counts = {row["status"]: row["n"] for row in db.execute("SELECT status,COUNT(*) n FROM question_generation_items WHERE job_id=? GROUP BY status", (job_id,)).fetchall()}
-        total = sum(counts.values()); complete = sum(counts.get(s,0) for s in ("draft","approved","rejected"))
-        updates = "progress_json=?,updated_at=?"; params: list = [_safe_json({"total": total, "completed": complete, "counts": counts}), stamp]
+        total = sum(counts.values())
+        completed = sum(counts.get(s, 0) for s in ("draft", "approved", "rejected"))
+        progress = {"total": total, "queued": counts.get("queued", 0), "running": counts.get("running", 0),
+                    "completed": completed, "failed": counts.get("failed", 0),
+                    "percentage_completed": int(completed * 100 / total) if total else 0, "counts": counts}
+        updates = "progress_json=?,updated_at=?"; params: list = [_safe_json(progress), stamp]
         if status is not None: updates += ",status=?"; params.append(status)
         updates += ",error=?"; params.append(error)
         params.append(job_id)
         db.execute(f"UPDATE question_generation_jobs SET {updates} WHERE job_id=?", params)
 
 
-async def _generate_one(client, job: dict, syllabus: dict, item: dict, examples: list[dict], avoid: list[str], lock: asyncio.Lock) -> dict:
-    request = json.loads(job["request_json"]) if isinstance(job.get("request_json"), str) else job.get("request", {})
+def _set_item_state(job_id: str, item_id: str, status: str, *, question: dict | None = None,
+                    error: str | None = None, retries: int | None = None) -> dict:
+    """Persist an item transition and matching progress snapshot atomically."""
+    stamp = now()
+    with database.connect() as db:
+        allowed_statuses = "status IN ('queued','failed','running')" if status == "running" else (
+            "status='running'" if status in {"draft", "failed"} else "1=1")
+        db.execute(f"""UPDATE question_generation_items SET status=?,question_json=?,error=?,
+            retries=COALESCE(?,retries),updated_at=? WHERE job_id=? AND item_id=? AND {allowed_statuses}""",
+                   (status, _safe_json(question) if question is not None else None, error, retries,
+                    stamp, job_id, item_id))
+        counts = {row["status"]: row["n"] for row in db.execute(
+            "SELECT status,COUNT(*) n FROM question_generation_items WHERE job_id=? GROUP BY status", (job_id,)).fetchall()}
+        total = sum(counts.values())
+        completed = sum(counts.get(s, 0) for s in ("draft", "approved", "rejected"))
+        progress = {"total": total, "queued": counts.get("queued", 0), "running": counts.get("running", 0),
+                    "completed": completed, "failed": counts.get("failed", 0),
+                    "percentage_completed": int(completed * 100 / total) if total else 0, "counts": counts}
+        db.execute("UPDATE question_generation_jobs SET progress_json=?,updated_at=? WHERE job_id=?",
+                   (_safe_json(progress), stamp, job_id))
+    return progress
+
+
+async def _generate_batch(client, job: dict, syllabus: dict | None, items: list[dict], examples: list[dict],
+                         avoid: list[str], lock: asyncio.Lock, diagnostics: dict | None = None) -> list[dict]:
+    if not items:
+        return []
+    request = job.get("request")
+    if not isinstance(request, dict):
+        request = json.loads(job["request_json"]) if isinstance(job.get("request_json"), str) else {}
     all_scope = request.get("resolved_scope") or []
-    selected_scope = [entry for entry in all_scope
-                      if str(entry.get("module_name", "")).casefold() == str(item.get("source_module", "")).casefold()
-                      and str(entry.get("heading", "")).casefold() == str(item.get("source_heading", "")).casefold()
-                      and str(entry.get("topic", "")).casefold() == str(item.get("topic", "")).casefold()]
+    selected_scope = all_scope
     bounded_examples = []
     example_chars = 0
     for example in examples:
@@ -1385,120 +1739,383 @@ async def _generate_one(client, job: dict, syllabus: dict, item: dict, examples:
             break
         bounded_examples.append({**example, "text": text})
         example_chars += len(text)
+    assignments = []
+    for index, item in enumerate(items, start=1):
+        guidance = request.get("resolved_guidance", {}).get(
+            _scope_key({"module_name": item.get("source_module"), "heading": item.get("source_heading"),
+                        "topic": item.get("topic")}))
+        if guidance is None:
+            guidance = _topic_generation_guidance(syllabus or {}, item)
+        section = next((value for value in request.get("sections", [])
+                        if str(value.get("name")) == str(item.get("section"))), {})
+        assignments.append({"question_number": index, "module": item.get("source_module"),
+            "section_heading": item.get("source_heading"), "topic": item["topic"],
+            "section": item["section"], "section_instructions": section.get("instructions", ""),
+            "marks": item["marks"], "question_type": item["type"], "difficulty": item["difficulty"],
+            "syllabus_topic_guidance": guidance})
     task = {"generation_context_id": request.get("generation_context_id"),
             "subject": job["subject_name"],
-            "selected_syllabus_scope": selected_scope,
-            "selected_topic": {"module": item.get("source_module"), "section_heading": item.get("source_heading"), "topic": item["topic"]},
-            "syllabus_topic_guidance": _topic_generation_guidance(syllabus, item),
+            "selected_syllabus_scope": request.get("resolved_hierarchy") or selected_scope,
+            "assignments": assignments,
             "examination": {key: request.get(key) for key in (
                 "university_name", "college_name", "department_name", "paper_title", "examination_name",
                 "academic_year", "semester", "exam_type", "subject_code", "examination_date", "duration",
                 "total_marks", "instructions", "blueprint_id", "blueprint_name", "blueprint_description")},
-            "section": item["section"], "section_instructions": item.get("instructions", ""), "marks": item["marks"],
-            "question_type": item["type"], "difficulty": item["difficulty"], "number_required": 1,
             "previous_question_examples": bounded_examples, "existing_questions_to_avoid":[str(text)[:400] for text in avoid[-30:]]}
-    system = ("Generate one original exam question strictly within the supplied selected syllabus scope and selected topic. "
-              "Do not use unselected syllabus content. Follow the examination, section, marks, type, difficulty, and instruction constraints. "
-              "Use the guidance as advisory question-format guidance. Examples are style references only; do not copy them. "
-              "Return JSON {questions:[...]}, exactly one question, no answers, with fields section, subject, topic, marks, type, difficulty, question_text, sub_questions.")
-    last = None
-    for attempt in range(settings.QUESTION_GENERATION_RETRIES + 1):
+    if len(items) == 1:
+        item = items[0]
+        task.update({"selected_topic": {"module": item.get("source_module"),
+            "section_heading": item.get("source_heading"), "topic": item["topic"]},
+            "syllabus_topic_guidance": assignments[0]["syllabus_topic_guidance"],
+            "section": item["section"], "section_instructions": assignments[0]["section_instructions"],
+            "marks": item["marks"], "question_type": item["type"], "difficulty": item["difficulty"],
+            "number_required": 1})
+    system = (f"Generate exactly {len(items)} original exam questions as compact JSON. Use the complete supplied syllabus hierarchy "
+              "for course context and follow each numbered assignment's module, section, topic, marks, type, difficulty, "
+              'and instructions. Return only a JSON object with a "questions" array; array order must match question_number. '
+              "Each entry must contain question_text and may contain sub_questions. Do not include answers, explanations, "
+              "markdown, or text outside JSON.")
+    preparation_duration = time.perf_counter() - (diagnostics.get("started_at", time.perf_counter()) if diagnostics else time.perf_counter())
+    if diagnostics is not None:
+        diagnostics["prompt_preparation_duration_seconds"] = preparation_duration
+    # Retry ownership lives in _generate_one so transport and output failures
+    # share one bounded per-question attempt budget.
+    retry_limit = 0
+    outcomes: list[dict | Exception | None] = [None] * len(items)
+    pending = list(range(len(items)))
+    feedback = None
+    calls = 0
+    for attempt in range(retry_limit + 1):
+        if not pending:
+            break
+        attempt_diag = {"http_attempts": 0,
+                        "generation_attempt": int((diagnostics or {}).get("generation_attempts", 0)) + 1}
+        pending_items = [items[index] for index in pending]
+        attempt_task = {**task, "assignments": [assignments[index] for index in pending]}
+        if feedback:
+            attempt_task["previous_attempt_feedback"] = feedback
+        metrics_recorded = False
         try:
-            result = await _chat(client, system, task)
+            token_budget = min(int(settings.QUESTION_GENERATION_MAX_TOKENS),
+                               max(768, 512 + sum(min(1600, max(256, int(item["marks"]) * 80))
+                                                   for item in pending_items)))
+            calls += 1
+            result = await _chat(client, system, attempt_task, max_tokens=token_budget,
+                                 job_id=job.get("job_id"), item_id=pending_items[0].get("item_id"),
+                                 diagnostics=attempt_diag, enable_thinking=False)
+            if diagnostics is not None:
+                diagnostics["http_attempts"] = diagnostics.get("http_attempts", 0) + attempt_diag["http_attempts"]
+                diagnostics["generation_attempts"] = diagnostics.get("generation_attempts", 0) + calls
+                for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+                    if attempt_diag.get(key) is not None:
+                        diagnostics[key] = (diagnostics.get(key) or 0) + attempt_diag[key]
+            metrics_recorded = True
             raw_questions = result.get("questions")
-            if not isinstance(raw_questions, list) or len(raw_questions) != 1: raise ValueError("Model returned the wrong question count")
-            question = _normalize_generated_question(raw_questions[0], item=item, subject_name=job["subject_name"])
-            if (question["marks"] != item["marks"] or question["section"] != item["section"]
-                    or question["subject"].casefold() != job["subject_name"].casefold()
-                    or question["type"].casefold() != item["type"].casefold()
-                    or question["difficulty"].casefold() != item["difficulty"].casefold()
-                    or question["topic"].casefold() != item["topic"].casefold()):
-                raise ValueError("Generated question does not match its section, topic, marks, type, or difficulty")
+            if not isinstance(raw_questions, list) or len(raw_questions) != len(pending):
+                raise _InvalidModelOutput(f"Model returned the wrong question count: got "
+                    f"{len(raw_questions) if isinstance(raw_questions, list) else 'no'}, expected {len(pending)}")
+            validation_started = time.perf_counter()
+            accepted: list[tuple[int, dict]] = []
+            rejected: dict[int, Exception] = {}
+            for index, raw in zip(pending, raw_questions):
+                item = items[index]
+                try:
+                    question = _normalize_generated_question(raw, item=item, subject_name=job["subject_name"])
+                    if (question["marks"] != item["marks"] or question["section"] != item["section"]
+                            or question["subject"].casefold() != job["subject_name"].casefold()
+                            or question["type"].casefold() != item["type"].casefold()
+                            or question["difficulty"].casefold() != item["difficulty"].casefold()
+                            or question["topic"].casefold() != item["topic"].casefold()):
+                        raise _InvalidModelOutput("Question does not match its assigned section, topic, marks, type, or difficulty")
+                    accepted.append((index, question))
+                except (ValueError, ValidationError) as exc:
+                    rejected[index] = exc
             async with lock:
-                if _is_duplicate(question["question_text"], avoid): raise ValueError("Generated question is a duplicate")
-                avoid.append(question["question_text"])
-            return question
+                accepted_texts: list[str] = []
+                for index, question in accepted:
+                    if _is_duplicate(question["question_text"], [*avoid, *accepted_texts]):
+                        rejected[index] = _InvalidModelOutput("Generated question is a duplicate")
+                    else:
+                        outcomes[index] = question
+                        accepted_texts.append(question["question_text"])
+                avoid.extend(accepted_texts)
+            _generation_event("question_validated", job_id=job.get("job_id"), item_id=pending_items[0].get("item_id"),
+                item_count=len(pending), accepted_count=len(accepted_texts), rejected_count=len(rejected),
+                attempt=attempt + 1, duration_seconds=round(time.perf_counter() - validation_started, 3))
+            pending = list(rejected)
+            if pending and attempt < retry_limit:
+                feedback = "; ".join(f"{items[index]['topic']}: {_generation_error_detail(error)}"
+                                      for index, error in rejected.items())[:700]
+                _generation_event("output_validation_retry", job_id=job.get("job_id"),
+                    item_ids=[items[index].get("item_id") for index in pending], item_count=len(pending),
+                    attempt=attempt + 1, retry_reason=feedback, retrying=True)
+                await asyncio.sleep(min(settings.QUESTION_GENERATION_BACKOFF_BASE * (2 ** attempt), 4.0))
+            elif pending:
+                for index, error in rejected.items():
+                    outcomes[index] = error
+                pending = []
         except Exception as exc:
-            last = exc
-            if attempt < settings.QUESTION_GENERATION_RETRIES:
-                await asyncio.sleep(min(2 ** attempt, 8))
-    detail = "; ".join(f"{entry['loc']}: {entry['msg']}" for entry in last.errors()) if isinstance(last, ValidationError) else str(last)
-    raise RuntimeError(f"Generation failed after bounded retries: {type(last).__name__}: {detail or 'no usable model output'}")
+            if not metrics_recorded and diagnostics is not None:
+                diagnostics["http_attempts"] = diagnostics.get("http_attempts", 0) + attempt_diag["http_attempts"]
+                diagnostics["generation_attempts"] = diagnostics.get("generation_attempts", 0) + calls
+                for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+                    if attempt_diag.get(key) is not None:
+                        diagnostics[key] = (diagnostics.get(key) or 0) + attempt_diag[key]
+            if attempt < retry_limit and isinstance(exc, _InvalidModelOutput):
+                feedback = _generation_error_detail(exc)
+                _generation_event("output_validation_retry", job_id=job.get("job_id"),
+                    item_ids=[items[index].get("item_id") for index in pending], item_count=len(pending),
+                    attempt=attempt + 1, retry_reason=feedback, retrying=True)
+                await asyncio.sleep(min(settings.QUESTION_GENERATION_BACKOFF_BASE * (2 ** attempt), 4.0))
+            else:
+                failure = exc if isinstance(exc, (_InvalidModelOutput, _GenerationRequestError, ValidationError)) else RuntimeError(
+                    f"Generation request failed: {type(exc).__name__}: {_generation_error_detail(exc)}")
+                for index in pending:
+                    outcomes[index] = failure
+                pending = []
+    for index in pending:
+        outcomes[index] = RuntimeError("Generation failed after bounded retries.")
+    return [outcome if outcome is not None else RuntimeError("Generation produced no question.") for outcome in outcomes]
+
+
+async def _generate_one(client, job: dict, syllabus: dict | None, item: dict, examples: list[dict],
+                        avoid: list[str], lock: asyncio.Lock, diagnostics: dict | None = None,
+                        on_retry=None) -> dict:
+    """Generate one question with a strict initial-plus-two-retries budget."""
+    max_retries = min(2, max(0, int(settings.QUESTION_GENERATION_MAX_RETRIES)))
+    last_error: Exception | None = None
+    for retry_index in range(max_retries + 1):
+        try:
+            result = (await _generate_batch(client, job, syllabus, [item], examples, avoid, lock, diagnostics))[0]
+            if isinstance(result, Exception):
+                raise result
+            return result
+        except Exception as exc:
+            last_error = exc
+            if isinstance(exc, _GenerationRequestError):
+                retryable = exc.retryable
+                category = exc.category
+                retry_after = exc.retry_after
+            elif isinstance(exc, (_InvalidModelOutput, ValidationError)):
+                retryable, category, retry_after = True, "invalid_output" if isinstance(exc, _InvalidModelOutput) else "validation_error", None
+            else:
+                retryable, category, retry_after = False, "permanent_request_error", None
+            if not retryable or retry_index >= max_retries:
+                if diagnostics is not None:
+                    diagnostics["failure_category"] = category
+                    diagnostics["failure_reason"] = _generation_error_detail(exc)
+                raise
+            next_retry = retry_index + 1
+            backoff = min(settings.QUESTION_GENERATION_BACKOFF_BASE * (2 ** retry_index), 8.0)
+            delay = retry_after if category == "rate_limit" and retry_after is not None else (
+                backoff if category in {"rate_limit", "network_error", "timeout", "server_error"} else 0.0)
+            _generation_event("question_retry_scheduled", job_id=job.get("job_id"), item_id=item.get("item_id"),
+                retry=next_retry, max_retries=max_retries, category=category,
+                retry_reason=_generation_error_detail(exc), backoff_seconds=round(delay, 3))
+            if diagnostics is not None:
+                diagnostics["retries_used"] = next_retry
+                diagnostics["failure_category"] = category
+                diagnostics["failure_reason"] = _generation_error_detail(exc)
+            if on_retry is not None:
+                await on_retry(next_retry, category, exc, delay)
+            if delay:
+                await asyncio.sleep(delay)
+    raise last_error or RuntimeError("Question generation failed without an error detail.")
+
+
+def _load_generation_rows(job_id: str):
+    with database.connect() as db:
+        job_row = db.execute("""SELECT j.*,s.subject_name FROM question_generation_jobs j
+            JOIN subjects s ON s.subject_id=j.subject_id WHERE job_id=?""", (job_id,)).fetchone()
+        items = [dict(r) for r in db.execute(
+            "SELECT * FROM question_generation_items WHERE job_id=? AND status IN ('queued','failed') ORDER BY position,item_id",
+            (job_id,)).fetchall()]
+        saved_questions = [json.loads(r["question_json"]).get("question_text", "") for r in db.execute(
+            "SELECT question_json FROM question_generation_items WHERE job_id=? AND status IN ('draft','approved') AND question_json IS NOT NULL",
+            (job_id,)).fetchall()]
+    return dict(job_row) if job_row else None, items, saved_questions
+
+
+def _job_state(job_id: str) -> str | None:
+    with database.connect() as db:
+        row = db.execute("SELECT status FROM question_generation_jobs WHERE job_id=?", (job_id,)).fetchone()
+    return row["status"] if row else None
+
+
+def _claim_job(job_id: str) -> bool:
+    """Allow only one worker to execute a queued job, including across processes."""
+    with database.connect() as db:
+        result = db.execute("UPDATE question_generation_jobs SET status='running',updated_at=? "
+                            "WHERE job_id=? AND status='queued'", (now(), job_id))
+        return bool(result.rowcount)
+
+
+def _cancel_queued_items(job_id: str) -> None:
+    with database.connect() as db:
+        db.execute("UPDATE question_generation_items SET status='cancelled',updated_at=? WHERE job_id=? AND status IN ('queued','failed')",
+                   (now(), job_id))
+
+
+def _job_item_counts(job_id: str) -> tuple[dict[str, int], str | None]:
+    with database.connect() as db:
+        counts = {row["status"]: row["n"] for row in db.execute(
+            "SELECT status,COUNT(*) n FROM question_generation_items WHERE job_id=? GROUP BY status", (job_id,)).fetchall()}
+        row = db.execute("SELECT status FROM question_generation_jobs WHERE job_id=?", (job_id,)).fetchone()
+    return counts, row["status"] if row else None
+
+
+def _set_docx_error(job_id: str, error: str | None) -> None:
+    with database.connect() as db:
+        db.execute("UPDATE question_generation_jobs SET docx_error=?,updated_at=? WHERE job_id=?",
+                   (error, now(), job_id))
 
 
 async def run_job(job_id: str) -> None:
     client = None
-    lock = asyncio.Lock()
+    duplicate_lock = asyncio.Lock()
+    progress_lock = asyncio.Lock()
+    job_started = time.perf_counter()
+    _generation_event("job_worker_started", job_id=job_id)
     try:
-        client = _nvidia_client()
-        with database.connect() as db:
-            job_row = db.execute("""SELECT j.*,s.subject_name FROM question_generation_jobs j
-                JOIN subjects s ON s.subject_id=j.subject_id WHERE job_id=?""", (job_id,)).fetchone()
-            items = [dict(r) for r in db.execute("SELECT * FROM question_generation_items WHERE job_id=? AND status IN ('queued','failed') ORDER BY position,item_id", (job_id,)).fetchall()]
-        if not job_row: raise KeyError("Generation job not found")
-        job = dict(job_row); request = json.loads(job["request_json"])
-        items.sort(key=lambda item: (item["section"], item["topic"], item["marks"], item["type"], item["difficulty"], item["position"]))
-        syllabus = get_syllabus(job["syllabus_id"])
-        if not syllabus: raise ValueError("Syllabus summary is missing")
-        sections = {str(s["name"]): s for s in request["sections"]}
-        for item in items: item["instructions"] = sections.get(item["section"], {}).get("instructions", "")
-        examples, existing = _existing_examples(job["subject_name"], [item["topic"] for item in items], [item["marks"] for item in items])
-        avoid = list(existing)
-        with database.connect() as db:
-            current = db.execute("SELECT status FROM question_generation_jobs WHERE job_id=?", (job_id,)).fetchone()
-        if current and current["status"] == "cancelling":
-            with database.connect() as db:
-                db.execute("UPDATE question_generation_items SET status='cancelled',updated_at=? WHERE job_id=? AND status IN ('queued','failed')", (now(),job_id))
-            _update_progress(job_id, status="cancelled")
+        if not await asyncio.to_thread(_claim_job, job_id):
+            _generation_event("job_worker_skipped", job_id=job_id, reason="job is not queued or was claimed by another worker")
             return
-        _update_progress(job_id, status="running")
+        client = _nvidia_client()
+        context_load_started = time.perf_counter()
+        job, items, saved_questions = await asyncio.to_thread(_load_generation_rows, job_id)
+        context_load_duration = time.perf_counter() - context_load_started
+        if not job:
+            raise KeyError("Generation job not found")
+        request = json.loads(job["request_json"])
+        job["request"] = request
+        items.sort(key=lambda item: (item["section"], item["topic"], item["marks"], item["type"], item["difficulty"], item["position"]))
+        sections = {str(section["name"]): section for section in request["sections"]}
+        for item in items:
+            item["instructions"] = sections.get(item["section"], {}).get("instructions", "")
+
+        examples_started = time.perf_counter()
+        examples, existing = await asyncio.to_thread(
+            _existing_examples, job["subject_name"], [item["topic"] for item in items], [item["marks"] for item in items])
+        _generation_event("worker_context_loaded", job_id=job_id, item_count=len(items),
+                          database_read_duration_seconds=round(context_load_duration, 3),
+                          duplicate_lookup_duration_seconds=round(time.perf_counter() - examples_started, 3))
+        avoid = [*existing, *saved_questions]
+        current = await asyncio.to_thread(_job_state, job_id)
+        if current == "cancelling":
+            await asyncio.to_thread(_cancel_queued_items, job_id)
+            await asyncio.to_thread(_update_progress, job_id, status="cancelled")
+            _generation_event("job_worker_finished", job_id=job_id, status="cancelled",
+                              duration_seconds=round(time.perf_counter() - job_started, 3))
+            return
+        await asyncio.to_thread(_update_progress, job_id)
         semaphore = asyncio.Semaphore(settings.QUESTION_GENERATION_CONCURRENCY)
 
+        async def change_item(item: dict, status: str, *, question: dict | None = None,
+                              error: str | None = None, retries: int | None = None) -> dict:
+            async with progress_lock:
+                return await asyncio.to_thread(_set_item_state, job_id, item["item_id"], status,
+                                               question=question, error=error, retries=retries)
+
         async def process_item(item):
-            with database.connect() as db:
-                current = db.execute("SELECT status FROM question_generation_jobs WHERE job_id=?", (job_id,)).fetchone()
-            if not current or current["status"] == "cancelling":
-                with database.connect() as db:
-                    db.execute("UPDATE question_generation_items SET status='cancelled',updated_at=? WHERE item_id=? AND status IN ('queued','failed')", (now(), item["item_id"]))
-                return
-            with database.connect() as db:
-                db.execute("UPDATE question_generation_items SET status='running',updated_at=? WHERE item_id=?", (now(), item["item_id"]))
-            try:
-                question = await _generate_one(client, job, syllabus, item, examples, avoid, lock)
-                with database.connect() as db:
-                    db.execute("UPDATE question_generation_items SET status='draft',question_json=?,error=NULL,updated_at=? WHERE item_id=?",
-                               (_safe_json(question),now(),item["item_id"]))
-            except Exception as exc:
-                logger.exception("Generation item %s failed", item["item_id"])
-                with database.connect() as db:
-                    db.execute("UPDATE question_generation_items SET status='failed',error=?,retries=?,updated_at=? WHERE item_id=?",
-                               (str(exc),settings.QUESTION_GENERATION_RETRIES,now(),item["item_id"]))
-            _update_progress(job_id)
-
-        async def process_batch(batch):
             async with semaphore:
-                await asyncio.gather(*(process_item(item) for item in batch))
+                state = await asyncio.to_thread(_job_state, job_id)
+                if not state or state == "cancelling":
+                    async with progress_lock:
+                        await asyncio.to_thread(_cancel_queued_items, job_id)
+                        await asyncio.to_thread(_update_progress, job_id)
+                    return
+                item_started = time.perf_counter()
+                await change_item(item, "running", retries=item.get("retries", 0))
+                _generation_event("item_started", job_id=job_id, item_id=item["item_id"], timestamp=now(),
+                                  concurrency=settings.QUESTION_GENERATION_CONCURRENCY)
+                diagnostics = {"started_at": item_started, "http_attempts": 0, "generation_attempts": 0}
+                previous_retries = int(item.get("retries", 0))
 
-        size = settings.QUESTION_GENERATION_BATCH_SIZE
-        batches = [items[index:index+size] for index in range(0,len(items),size)]
-        await asyncio.gather(*(process_batch(batch) for batch in batches))
-        with database.connect() as db:
-            remaining = db.execute("SELECT COUNT(*) n FROM question_generation_items WHERE job_id=? AND status IN ('queued','running')", (job_id,)).fetchone()["n"]
-            failed = db.execute("SELECT COUNT(*) n FROM question_generation_items WHERE job_id=? AND status='failed'", (job_id,)).fetchone()["n"]
-            final_state = db.execute("SELECT status FROM question_generation_jobs WHERE job_id=?", (job_id,)).fetchone()["status"]
+                async def record_retry(retry_number, category, exc, delay):
+                    reason = f"{category}: {_generation_error_detail(exc)}; retry {retry_number}/{settings.QUESTION_GENERATION_MAX_RETRIES}"
+                    progress = await change_item(item, "running", error=reason,
+                                                 retries=previous_retries + retry_number)
+                    _generation_event("question_retry_progress", job_id=job_id, item_id=item["item_id"],
+                        retry=retry_number, category=category, backoff_seconds=round(delay, 3),
+                        retry_reason=_generation_error_detail(exc), progress=progress)
+                try:
+                    question = await _generate_one(client, job, None, item, examples, avoid,
+                                                   duplicate_lock, diagnostics, on_retry=record_retry)
+                except Exception as exc:
+                    logger.warning("Question generation exhausted job_id=%s item_id=%s category=%s reason=%s",
+                                   job_id, item["item_id"], diagnostics.get("failure_category", "unknown"),
+                                   _generation_error_detail(exc))
+                    failure_category = diagnostics.get("failure_category", "unknown")
+                    failure_reason = diagnostics.get("failure_reason", _generation_error_detail(exc))
+                    progress = await change_item(item, "failed", error=f"{failure_category}: {failure_reason}",
+                        retries=previous_retries + diagnostics.get("retries_used", 0))
+                    _generation_event("item_finished", job_id=job_id, item_id=item["item_id"],
+                        status="failed", failure_category=failure_category,
+                        retry_reason=failure_reason, progress=progress,
+                        total_duration_seconds=round(time.perf_counter() - item_started, 3))
+                    return
+                _generation_event("item_model_finished", job_id=job_id, item_id=item["item_id"],
+                    http_attempts=diagnostics.get("http_attempts", 0),
+                    generation_attempts=diagnostics.get("generation_attempts", 0),
+                    prompt_preparation_duration_seconds=round(diagnostics.get("prompt_preparation_duration_seconds", 0), 3),
+                    prompt_tokens=diagnostics.get("prompt_tokens"),
+                    completion_tokens=diagnostics.get("completion_tokens"),
+                    total_tokens=diagnostics.get("total_tokens"),
+                    duration_seconds=round(time.perf_counter() - item_started, 3))
+                persist_started = time.perf_counter()
+                try:
+                    progress = await change_item(item, "draft", question=question,
+                        retries=previous_retries + diagnostics.get("retries_used", 0), error=None)
+                    _generation_event("item_finished", job_id=job_id, item_id=item["item_id"],
+                        status="draft", database_persistence_duration_seconds=round(time.perf_counter() - persist_started, 3),
+                        total_duration_seconds=round(time.perf_counter() - item_started, 3), progress=progress)
+                except Exception as exc:
+                    logger.exception("Could not persist generated question job_id=%s item_id=%s", job_id, item["item_id"])
+                    progress = await change_item(item, "failed", error=f"Could not persist question: {exc}")
+                    _generation_event("item_finished", job_id=job_id, item_id=item["item_id"],
+                        status="failed", retry_reason=str(exc)[:400], progress=progress)
+
+        await asyncio.gather(*(process_item(item) for item in items))
+        counts, final_state = await asyncio.to_thread(_job_item_counts, job_id)
+        remaining = counts.get("queued", 0) + counts.get("running", 0)
+        failed = counts.get("failed", 0)
         if final_state == "cancelling":
-            _update_progress(job_id, status="cancelled")
+            await asyncio.to_thread(_update_progress, job_id, status="cancelled")
         elif remaining:
-            _update_progress(job_id, status="partial", error="Generation stopped before every requested question completed; retry the pending questions.")
+            await asyncio.to_thread(_update_progress, job_id, status="partial",
+                                    error="Generation stopped before every requested question completed; retry the pending questions.")
         elif failed:
-            status = "failed" if failed == len(items) else "partial"
-            _update_progress(job_id, status=status,
-                             error=f"{failed} of {len(items)} requested questions failed. Retry the failed items.")
+            total_items = sum(counts.values())
+            status = "failed" if failed == total_items else "partial"
+            await asyncio.to_thread(_update_progress, job_id, status=status,
+                                    error=f"{failed} of {total_items} requested questions failed. Retry the failed items.")
         else:
-            _update_progress(job_id, status="completed")
+            # Pollers commonly stop when they see "completed". Keep the job
+            # running until its download is actually persisted.
+            await asyncio.to_thread(_update_progress, job_id, status="running", error=None)
+            await asyncio.to_thread(_set_docx_error, job_id, None)
+            docx_started = time.perf_counter()
+            try:
+                await asyncio.to_thread(render_job_docx, job_id)
+                await asyncio.to_thread(_update_progress, job_id, status="completed", error=None)
+                _generation_event("job_docx_ready", job_id=job_id,
+                                  duration_seconds=round(time.perf_counter() - docx_started, 3))
+            except Exception as exc:
+                logger.exception("Could not automatically create completed question paper DOCX job_id=%s", job_id)
+                message = f"DOCX generation failed: {type(exc).__name__}: {exc}"
+                await asyncio.to_thread(_set_docx_error, job_id, message)
+                await asyncio.to_thread(_update_progress, job_id, status="failed", error=message)
+                _generation_event("job_docx_failed", job_id=job_id,
+                                  duration_seconds=round(time.perf_counter() - docx_started, 3),
+                                  error=str(exc)[:400])
+        final = await asyncio.to_thread(_job_state, job_id)
+        _generation_event("job_worker_finished", job_id=job_id, status=final, item_counts=counts,
+                          duration_seconds=round(time.perf_counter() - job_started, 3))
     except Exception as exc:
         logger.exception("Question generation job %s failed", job_id)
-        _update_progress(job_id, status="failed", error=f"{type(exc).__name__}: {exc}")
+        await asyncio.to_thread(_update_progress, job_id, status="failed", error=f"{type(exc).__name__}: {exc}")
+        _generation_event("job_worker_failed", job_id=job_id, status="failed", exception=type(exc).__name__,
+                          error=str(exc)[:400], duration_seconds=round(time.perf_counter() - job_started, 3))
     finally:
         if client is not None:
             await client.close()
@@ -1518,11 +2135,12 @@ def start_job(job_id: str) -> None:
 def retry_job(job_id: str) -> bool:
     stamp = now()
     with database.connect() as db:
-        row = db.execute("SELECT status FROM question_generation_jobs WHERE job_id=?", (job_id,)).fetchone()
-        if not row or row["status"] not in {"failed", "partial", "cancelled"}:
+        claimed = db.execute("UPDATE question_generation_jobs SET status='queued',error=NULL,updated_at=? "
+                             "WHERE job_id=? AND status IN ('failed','partial','cancelled')", (stamp, job_id))
+        if not claimed.rowcount:
             return False
         db.execute("UPDATE question_generation_items SET status='queued',error=NULL,updated_at=? WHERE job_id=? AND status IN ('failed','queued','running')", (stamp,job_id))
-        db.execute("UPDATE question_generation_jobs SET status='queued',error=NULL,updated_at=? WHERE job_id=?", (stamp,job_id))
+    _update_progress(job_id, status="queued", error=None)
     return True
 
 
@@ -1531,6 +2149,8 @@ def cancel_job(job_id: str) -> bool:
     with database.connect() as db:
         cur = db.execute("UPDATE question_generation_jobs SET status='cancelling',updated_at=? WHERE job_id=? AND status IN ('queued','running','partial')", (stamp,job_id))
         db.execute("UPDATE question_generation_items SET status='cancelled',updated_at=? WHERE job_id=? AND status IN ('queued','failed')", (stamp,job_id))
+    if cur.rowcount:
+        _update_progress(job_id, status="cancelling")
     return cur.rowcount > 0
 
 
@@ -1538,8 +2158,11 @@ def recover_interrupted_jobs() -> None:
     """Expose interrupted in-process work as retryable without touching saved drafts."""
     stamp = now()
     with database.connect() as db:
+        jobs = [row["job_id"] for row in db.execute("SELECT job_id FROM question_generation_jobs WHERE status IN ('queued','running','cancelling')").fetchall()]
         db.execute("UPDATE question_generation_items SET status='queued',updated_at=? WHERE status='running' AND job_id IN (SELECT job_id FROM question_generation_jobs WHERE status IN ('queued','running','cancelling'))", (stamp,))
         db.execute("UPDATE question_generation_jobs SET status='partial',error='Worker stopped before generation completed; retry pending questions.',updated_at=? WHERE status IN ('queued','running','cancelling')", (stamp,))
+    for job_id in jobs:
+        _update_progress(job_id, status="partial", error="Worker stopped before generation completed; retry pending questions.")
 
 
 def get_job(job_id: str) -> dict | None:
@@ -1547,14 +2170,32 @@ def get_job(job_id: str) -> dict | None:
         row = db.execute("SELECT * FROM question_generation_jobs WHERE job_id=?", (job_id,)).fetchone()
         if not row: return None
         job = dict(row)
+        docx_available = job.get("docx_blob") is not None
         rows = db.execute("SELECT * FROM question_generation_items WHERE job_id=? ORDER BY position,item_id", (job_id,)).fetchall()
     job.pop("docx_blob", None)
-    job["request"] = json.loads(job.pop("request_json")); job["progress"] = json.loads(job.pop("progress_json"))
+    job["request"] = json.loads(job.pop("request_json"))
+    stored_progress = json.loads(job.pop("progress_json"))
     job["items"] = []
+    counts: dict[str, int] = {}
     for row in rows:
         item = dict(row)
         item["question"] = json.loads(item.pop("question_json")) if item.get("question_json") else None
+        counts[item["status"]] = counts.get(item["status"], 0) + 1
         job["items"].append(item)
+    total = len(job["items"])
+    completed = sum(counts.get(state, 0) for state in ("draft", "approved", "rejected"))
+    job["progress"] = {**stored_progress, "total": total, "queued": counts.get("queued", 0),
+                        "running": counts.get("running", 0), "completed": completed,
+                        "failed": counts.get("failed", 0),
+                        "percentage_completed": int(completed * 100 / total) if total else 0,
+                        "counts": counts}
+    job.update({"total_questions": total, "queued_questions": counts.get("queued", 0),
+                "running_questions": counts.get("running", 0), "completed_questions": completed,
+                "failed_questions": counts.get("failed", 0),
+                "percentage_completed": int(completed * 100 / total) if total else 0,
+                "docx_ready": docx_available,
+                "docx_error": job.get("docx_error"),
+                "docx_url": f"/api/smart-qpg/generation-jobs/{job_id}/docx" if docx_available else None})
     return job
 
 
@@ -1587,6 +2228,8 @@ def edit_item(job_id: str, item_id: str, question: dict | None) -> bool:
             db.execute("UPDATE question_generation_jobs SET docx_blob=NULL,updated_at=? WHERE job_id=?",(stamp,job_id))
             db.execute("DELETE FROM generated_papers WHERE paper_id=?", (job_id,))
         changed = cur.rowcount > 0
+    if changed:
+        _update_progress(job_id)
     return changed
 
 
@@ -1602,17 +2245,34 @@ def approve_items(job_id: str, item_ids: list[str]) -> int:
             db.execute("UPDATE question_generation_items SET status='approved',updated_at=? WHERE job_id=? AND item_id=? AND status='draft'", (stamp,job_id,item_id))
         db.execute("UPDATE question_generation_jobs SET docx_blob=NULL,updated_at=? WHERE job_id=?",(stamp,job_id))
         db.execute("DELETE FROM generated_papers WHERE paper_id=?", (job_id,))
+    _update_progress(job_id)
     return len(item_ids)
 
 
-async def regenerate_item(job_id: str, item_id: str) -> dict:
+def _load_regeneration_data(job_id: str, item_id: str):
     with database.connect() as db:
         row = db.execute("""SELECT i.*,j.request_json,j.syllabus_id,j.subject_id,s.subject_name
             FROM question_generation_items i JOIN question_generation_jobs j ON j.job_id=i.job_id
             JOIN subjects s ON s.subject_id=j.subject_id WHERE i.job_id=? AND i.item_id=?""", (job_id,item_id)).fetchone()
         accepted = db.execute("SELECT question_json FROM question_generation_items WHERE job_id=? AND status IN ('draft','approved') AND item_id<>?",(job_id,item_id)).fetchall()
-    if not row: raise KeyError("Generation item not found")
-    item = dict(row)
+    return (dict(row) if row else None), [dict(entry) for entry in accepted]
+
+
+def _persist_regenerated_question(job_id: str, item_id: str, question: dict) -> None:
+    stamp = now()
+    with database.connect() as db:
+        db.execute("UPDATE question_generation_items SET question_json=?,status='draft',error=NULL,retries=retries+1,updated_at=? WHERE job_id=? AND item_id=?",
+                   (_safe_json(question), stamp, job_id, item_id))
+        db.execute("UPDATE question_generation_jobs SET docx_blob=NULL,updated_at=? WHERE job_id=?", (stamp, job_id))
+        db.execute("DELETE FROM generated_papers WHERE paper_id=?", (job_id,))
+
+
+async def regenerate_item(job_id: str, item_id: str) -> dict:
+    started = time.perf_counter()
+    _generation_event("item_started", job_id=job_id, item_id=item_id, timestamp=now(), operation="regenerate")
+    item, accepted = await asyncio.to_thread(_load_regeneration_data, job_id, item_id)
+    if not item:
+        raise KeyError("Generation item not found")
     request = json.loads(item["request_json"])
     section = next((s for s in request.get("sections", []) if s.get("name") == item["section"]), {})
     item["instructions"] = section.get("instructions", "")
@@ -1622,19 +2282,32 @@ async def regenerate_item(job_id: str, item_id: str) -> dict:
             existing.append(json.loads(item["question_json"]).get("question_text", ""))
         except (TypeError, ValueError):
             pass
-    examples, old_questions = _existing_examples(item["subject_name"],[item["topic"]],[item["marks"]])
+    examples, old_questions = await asyncio.to_thread(
+        _existing_examples, item["subject_name"], [item["topic"]], [item["marks"]])
     avoid = old_questions + existing
     client = _nvidia_client()
+    diagnostics = {"started_at": time.perf_counter(), "http_attempts": 0, "generation_attempts": 0}
     try:
-        job = {"subject_name": item["subject_name"], "request_json": item["request_json"]}
-        question = await _generate_one(client, job, get_syllabus(item["syllabus_id"]), item, examples, avoid, asyncio.Lock())
+        job = {"job_id": job_id, "subject_name": item["subject_name"], "request_json": item["request_json"]}
+        question = await _generate_one(client, job, None, item, examples, avoid, asyncio.Lock(), diagnostics)
+        persist_started = time.perf_counter()
+        await asyncio.to_thread(_persist_regenerated_question, job_id, item_id, question)
+        await asyncio.to_thread(_update_progress, job_id)
+        _generation_event("item_finished", job_id=job_id, item_id=item_id, status="draft",
+                          http_attempts=diagnostics.get("http_attempts", 0),
+                          generation_attempts=diagnostics.get("generation_attempts", 0),
+                          database_persistence_duration_seconds=round(time.perf_counter() - persist_started, 3),
+                          total_duration_seconds=round(time.perf_counter() - started, 3))
+        return question
+    except Exception as exc:
+        _generation_event("item_finished", job_id=job_id, item_id=item_id, status="failed",
+                          http_attempts=diagnostics.get("http_attempts", 0),
+                          generation_attempts=diagnostics.get("generation_attempts", 0),
+                          retry_reason=_generation_error_detail(exc),
+                          total_duration_seconds=round(time.perf_counter() - started, 3))
+        raise
     finally:
         await client.close()
-    with database.connect() as db:
-        db.execute("UPDATE question_generation_items SET question_json=?,status='draft',error=NULL,retries=retries+1,updated_at=? WHERE item_id=?",(_safe_json(question),now(),item_id))
-        db.execute("UPDATE question_generation_jobs SET docx_blob=NULL,updated_at=? WHERE job_id=?",(now(),job_id))
-        db.execute("DELETE FROM generated_papers WHERE paper_id=?", (job_id,))
-    return question
 
 
 def render_job_docx(job_id: str) -> bytes:
@@ -1642,11 +2315,11 @@ def render_job_docx(job_id: str) -> bytes:
     if not job: raise KeyError("Generation job not found")
     request = job["request"]
     expected_count = int(request.get("calculated_total_questions") or 0)
-    approved_items = [item for item in job["items"] if item["status"] == "approved" and item.get("question")]
-    if len(approved_items) != expected_count or len(job["items"]) != expected_count:
-        raise ValueError("Approve every required question before generating the final paper.")
+    generated_items = [item for item in job["items"] if item["status"] in {"draft", "approved"} and item.get("question")]
+    if len(generated_items) != expected_count or len(job["items"]) != expected_count:
+        raise ValueError("Every requested question must be generated successfully before the complete paper is available.")
     validated = []
-    for item in approved_items:
+    for item in generated_items:
         question = GeneratedQuestion.model_validate(item["question"]).model_dump()
         expected = {"section": item["section"], "topic": item["topic"], "marks": item["marks"],
                     "type": item["type"], "difficulty": item["difficulty"],
@@ -1702,7 +2375,7 @@ def render_job_docx(job_id: str) -> bytes:
         "duration": request.get("duration") or "", "requested_total_marks": int(request["calculated_total_marks"]),
         "total_marks": int(request["calculated_total_marks"]), "sections": sections,
         "instructions": instructions, "blueprint_id": request.get("blueprint_id"),
-        "blueprint_name": request.get("blueprint_name"), "generation_status": "approved",
+        "blueprint_name": request.get("blueprint_name"), "generation_status": "generated",
         "blueprint_description": request.get("blueprint_description"),
         "generation_request": request,
         "generated_by": job["created_by"], "generated_at": now(),
@@ -1723,7 +2396,7 @@ def render_job_docx(job_id: str) -> bytes:
     numbered = [int(match.group(1)) for text in paragraph_texts
                 if (match := re.match(r"^(\d+)\. ", text))]
     if numbered != list(range(1, expected_count + 1)):
-        raise ValueError("The rendered DOCX question count does not match the approved paper.")
+        raise ValueError("The rendered DOCX question count does not match the generated paper.")
     for required in (paper["title"], subject["subject_name"], f"Total marks: {paper['total_marks']}"):
         if required not in document_text:
             raise ValueError(f"The rendered DOCX is missing required paper content: {required}")
@@ -1762,7 +2435,7 @@ def render_job_docx(job_id: str) -> bytes:
             paper_id,subject_name,storage_key,paper_json,docx_blob,created_at,updated_at)
             VALUES(?,?,?,?,?,?,?)""",
             (paper_id, subject["subject_name"], f"{paper_id}.docx", _safe_json(paper), content, stamp, stamp))
-        db.execute("UPDATE question_generation_jobs SET docx_blob=?,updated_at=? WHERE job_id=?", (content, stamp, job_id))
+        db.execute("UPDATE question_generation_jobs SET docx_blob=?,docx_error=NULL,updated_at=? WHERE job_id=?", (content, stamp, job_id))
         db.commit()
     return content
 

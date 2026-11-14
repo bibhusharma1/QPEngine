@@ -17,6 +17,10 @@ uvicorn src.masterdeorca.app:app --reload --host 0.0.0.0 --port 8000
 
 Swagger UI: `http://localhost:8000/docs`.
 
+## Local authentication
+
+There is no default account and startup does not seed an administrator. For isolated local development, configure an untracked `.env` with `APP_ENV=local`, `DATABASE_BACKEND=sqlite`, local `DATABASE_PATH` and `QUES_STORAGE_ROOT` paths, a private `QUES_JWT_SECRET`, and explicit `QUES_ADMIN_EMAIL` / `QUES_ADMIN_PASSWORD` values. Then run `python scripts/create_local_admin.py` once. The command is restricted to local SQLite, uses the application password hasher, and refuses to overwrite an existing account. Render deployments must use `APP_ENV=render` with Turso; local SQLite configuration is rejected there.
+
 ## Running tests
 
 - CI: `uv run pytest tests/Parser tests/Reconstruct tests/Scrapper` (80 passed).

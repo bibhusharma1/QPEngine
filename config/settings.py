@@ -22,17 +22,17 @@ def resolve_path(value: str | Path, *, base: Path | None = None) -> Path:
     return ((base or PROJECT_ROOT) / path).resolve()
 
 
-# Render-only deployment configuration
-STORAGE_ROOT = resolve_path(setting("QUES_STORAGE_ROOT", "/data"))
+# Runtime and deployment configuration
+APP_ENV = setting("APP_ENV", "render").casefold()
+STORAGE_ROOT = resolve_path(setting("QUES_STORAGE_ROOT", str(PROJECT_ROOT / "data") if APP_ENV == "local" else "/data"))
 DEFAULT_SUBJECT = setting("QUES_DEFAULT_SUBJECT", "OperatingSys")
 MAX_UPLOAD_BYTES = int(setting("QUES_MAX_UPLOAD_MB", "50")) * 1024 * 1024
 API_PORT = int(setting("QUES_PORT", "8000"))
 DATABASE_BACKEND = setting("DATABASE_BACKEND", "turso").casefold()
-# Used only by explicit offline legacy-database tools; runtime services never read it.
-DATABASE_PATH = resolve_path(setting("DATABASE_PATH", "/data/masterdeorca.sqlite"))
+# Local SQLite runtime database path; Render uses Turso instead.
+DATABASE_PATH = resolve_path(setting("DATABASE_PATH", str(PROJECT_ROOT / "data" / "masterdeorca.sqlite") if APP_ENV == "local" else "/data/masterdeorca.sqlite"))
 _storage_backend = setting("STORAGE_BACKEND", "sqlite").casefold()
 STORAGE_BACKEND = "sqlite" if _storage_backend == "local" else _storage_backend
-APP_ENV = setting("APP_ENV", "render").casefold()
 TURSO_DATABASE_URL = setting("TURSO_DATABASE_URL", "")
 TURSO_AUTH_TOKEN = setting("TURSO_AUTH_TOKEN", "")
 RECONCILE_ENABLED = setting("QUES_RECONCILE_ENABLED", "true").casefold() in {
@@ -42,8 +42,8 @@ RECONCILE_INTERVAL_HOURS = int(setting("QUES_RECONCILE_INTERVAL_HOURS", "12"))
 JWT_SECRET = setting("QUES_JWT_SECRET", "")
 JWT_TTL_MINUTES = int(setting("QUES_JWT_TTL_MINUTES", "480"))
 ADMIN_EMAIL = setting("QUES_ADMIN_EMAIL", "admin@example.com").lower()
-ADMIN_PASSWORD = setting("QUES_ADMIN_PASSWORD", "admin@123")
-DEFAULT_TEACHER_PASSWORD = setting("QUES_DEFAULT_TEACHER_PASSWORD", "admin@123")
+ADMIN_PASSWORD = setting("QUES_ADMIN_PASSWORD", "")
+DEFAULT_TEACHER_PASSWORD = setting("QUES_DEFAULT_TEACHER_PASSWORD", "")
 CORS_ORIGINS = [origin.strip() for origin in setting("QUES_CORS_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000,http://localhost:5173,http://127.0.0.1:5173").split(",") if origin.strip()]
 QUES_TOTP_ENCRYPTION_KEY = setting("QUES_TOTP_ENCRYPTION_KEY", "")
 TOTP_ISSUER = setting("QUES_TOTP_ISSUER", "Smart QPG")
@@ -87,15 +87,21 @@ NVIDIA_API_TIMEOUT = float(setting("NVIDIA_API_TIMEOUT", "300"))
 NVIDIA_API_RETRIES = int(setting("NVIDIA_API_RETRIES", "3"))
 NVIDIA_API_CONCURRENCY = int(setting("NVIDIA_API_CONCURRENCY", "2"))
 NVIDIA_API_BACKOFF_BASE = float(setting("NVIDIA_API_BACKOFF_BASE", "1.0"))
-QUESTION_GENERATION_MODEL = setting("QUESTION_GENERATION_MODEL", "nvidia/nemotron-3-ultra-550b-a55b")
+QUESTION_GENERATION_MODEL = setting("QUESTION_GENERATION_MODEL", "nvidia/nemotron-3.5-lightning-30b-a3b")
 QUESTION_GENERATION_BASE_URL = setting("QUESTION_GENERATION_BASE_URL", "https://integrate.api.nvidia.com/v1")
 QUESTION_GENERATION_TEMPERATURE = float(setting("QUESTION_GENERATION_TEMPERATURE", "1.0"))
 QUESTION_GENERATION_TOP_P = float(setting("QUESTION_GENERATION_TOP_P", "0.95"))
 QUESTION_GENERATION_MAX_TOKENS = int(setting("QUESTION_GENERATION_MAX_TOKENS", "16384"))
 QUESTION_GENERATION_ENABLE_THINKING = setting("QUESTION_GENERATION_ENABLE_THINKING", "true").casefold() in {"1", "true", "yes", "on"}
-QUESTION_GENERATION_CONCURRENCY = max(1, int(setting("QUESTION_GENERATION_CONCURRENCY", "3")))
-QUESTION_GENERATION_BATCH_SIZE = max(1, int(setting("QUESTION_GENERATION_BATCH_SIZE", "3")))
+QUESTION_GENERATION_CONCURRENCY = min(3, max(1, int(setting("QUESTION_GENERATION_CONCURRENCY", "3"))))
+QUESTION_GENERATION_BATCH_SIZE = min(5, max(1, int(setting("QUESTION_GENERATION_BATCH_SIZE", "3"))))
 QUESTION_GENERATION_RETRIES = max(0, int(setting("QUESTION_GENERATION_RETRIES", "3")))
+QUESTION_GENERATION_OUTPUT_RETRIES = min(1, max(0, int(setting(
+    "QUESTION_GENERATION_OUTPUT_RETRIES", str(QUESTION_GENERATION_RETRIES)))))
+QUESTION_GENERATION_MAX_RETRIES = min(2, max(0, int(setting("QUESTION_GENERATION_MAX_RETRIES", "2"))))
+QUESTION_GENERATION_TIMEOUT = max(1.0, min(300.0, float(setting("QUESTION_GENERATION_TIMEOUT", "180"))))
+QUESTION_GENERATION_API_ATTEMPTS = min(3, max(1, int(setting("QUESTION_GENERATION_API_ATTEMPTS", "3"))))
+QUESTION_GENERATION_BACKOFF_BASE = max(0.0, min(4.0, float(setting("QUESTION_GENERATION_BACKOFF_BASE", "1"))))
 SMART_QPG_SYLLABUS_INPUT_TOKEN_BUDGET = int(setting("SMART_QPG_SYLLABUS_INPUT_TOKEN_BUDGET", "6000"))
 SMART_QPG_SYLLABUS_STRUCTURE_OUTPUT_TOKENS = int(setting("SMART_QPG_SYLLABUS_STRUCTURE_OUTPUT_TOKENS", "5000"))
 SMART_QPG_SYLLABUS_GUIDANCE_OUTPUT_TOKENS = int(setting("SMART_QPG_SYLLABUS_GUIDANCE_OUTPUT_TOKENS", "1800"))

@@ -10,12 +10,13 @@ import logging
 import os
 import threading
 import tempfile
+import time
 import uuid
 import zipfile
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 from urllib.parse import quote
 
 from fastapi import BackgroundTasks, Body, Depends, FastAPI, File, Form, HTTPException, Request, UploadFile, Query
@@ -89,19 +90,6 @@ def _startup() -> None:
     smart_qpg_service.resume_interrupted_syllabus_uploads()
     with database.connect() as db:
         database.ensure_subject_record(db, app_settings.DEFAULT_SUBJECT)
-        # temporary test seed
-        try:
-            from pwdlib import PasswordHash
-            ph = database._password_hash
-            h = ph.hash("admin@123")
-            now = __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat()
-            db.execute("INSERT OR IGNORE INTO users(email,name,hashed_password,role,status,created_at) VALUES(?,?,?,?,?,?)",
-                       ("admin@example.com","Administrator",h,"admin","active",now))
-            db.execute("INSERT OR IGNORE INTO admins(email,password_hash) VALUES(?,?)",
-                       ("admin@example.com",h))
-            db.commit()
-        except Exception as e:
-            print("seed err", e)
 
 
 @asynccontextmanager
@@ -276,13 +264,6 @@ class GenerationSection(BaseModel):
         return value
 
 
-class SelectedSyllabusTopic(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    module_name: str = Field(min_length=1, max_length=160)
-    heading: str = Field(min_length=1, max_length=200)
-    topic: str = Field(min_length=1, max_length=300)
-
-
 class QuestionGenerationRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     configuration_id: str | None = Field(default=None, validation_alias=AliasChoices("configuration_id", "config_id"))
@@ -299,15 +280,20 @@ class QuestionGenerationRequest(BaseModel):
     examination_date: str | None = Field(default=None, max_length=80, validation_alias=AliasChoices("examination_date", "exam_date"))
     duration: str | None = Field(default=None, max_length=100)
     total_marks: int | None = Field(default=None, ge=1, le=1000)
-    instructions: str | list[str] = ""
+    # Smart QPG uses this accepted field for general instructions plus the
+    # frontend's selected syllabus hierarchy. Keep it structured when sent;
+    # create_job extracts only general instructions for the model prompt.
+    instructions: str | list[Any] | dict[str, Any] = ""
     syllabus_id: str = Field(min_length=1, max_length=100)
+    syllabus_summary: dict[str, Any] | str | None = Field(default=None,
+        validation_alias=AliasChoices("syllabus_summary", "summary_data", "syllabus_summary_data", "summary"))
     examination_name: str | None = Field(default=None, max_length=200)
     blueprint_id: str | None = Field(default=None, max_length=100)
     blueprint_name: str | None = Field(default=None, max_length=200)
     blueprint_description: str | None = Field(default=None, max_length=2000)
     selected_topics: list[str] = Field(default_factory=list, max_length=100, validation_alias=AliasChoices("selected_topics", "topics"))
-    selected_modules: list[str] = Field(default_factory=list, max_length=50)
-    selected_scope: list[SelectedSyllabusTopic] = Field(default_factory=list, max_length=300)
+    selected_modules: list[str | dict[str, Any]] = Field(default_factory=list, max_length=50,
+        validation_alias=AliasChoices("selected_modules", "modules"))
     sections: list[GenerationSection] = Field(min_length=1, max_length=30)
 
     @model_validator(mode="before")
@@ -326,7 +312,7 @@ class QuestionGenerationRequest(BaseModel):
             "examination_date": ("exam_date",),
             "selected_topics": ("topics",),
             "selected_modules": ("modules",),
-            "selected_scope": ("selected_module_topics", "module_topics"),
+            "syllabus_summary": ("summary_data", "syllabus_summary_data", "summary"),
         }.items():
             for alias in aliases:
                 if alias in value:
@@ -352,11 +338,24 @@ class QuestionGenerationRequest(BaseModel):
 
     @field_validator("selected_modules")
     @classmethod
-    def clean_modules(cls, values: list[str]) -> list[str]:
-        cleaned = [value.strip() for value in values]
-        if any(not value for value in cleaned) or len({value.casefold() for value in cleaned}) != len(cleaned):
-            raise ValueError("selected modules must be non-empty and unique")
-        return cleaned
+    def clean_modules(cls, values: list[str | dict[str, Any]]) -> list[str | dict[str, Any]]:
+        keys: list[str] = []
+        for value in values:
+            if isinstance(value, str):
+                name = value.strip()
+                if not name:
+                    raise ValueError("selected modules must be non-empty")
+                keys.append(name.casefold())
+            elif isinstance(value, dict):
+                name = str(value.get("module_name") or value.get("name") or value.get("module") or value.get("module_id") or value.get("id") or "").strip()
+                if not name:
+                    raise ValueError("each selected module must include a module name or ID")
+                keys.append(name.casefold())
+            else:
+                raise ValueError("selected modules must be module names or objects containing a name or ID")
+        if len(set(keys)) != len(keys):
+            raise ValueError("selected modules must be unique")
+        return values
 
     @field_validator("total_marks", mode="before")
     @classmethod
@@ -1386,20 +1385,34 @@ def delete_syllabus(syllabus_id: str, user: SyllabusManager) -> None:
 @app.post("/api/smart-qpg/generation-jobs", status_code=202, tags=["question generation"])
 def create_question_generation_job(request: QuestionGenerationRequest, background_tasks: BackgroundTasks,
                                   user: Annotated[str, Depends(require_write_user)]) -> dict:
+    _require_syllabus_subject_access(user, request.subject_id)
     _smart_qpg_subject(user, request.subject_id)
     _enforce_subject_permission(user, database.get_subject_by_id(request.subject_id)["subject_name"], "generate_papers")
+    syllabus_started = time.perf_counter()
     syllabus = smart_qpg_service.get_syllabus(request.syllabus_id)
+    syllabus_duration = time.perf_counter() - syllabus_started
     if not syllabus:
         raise HTTPException(status_code=404, detail="Syllabus not found")
     if syllabus["subject_id"] != request.subject_id:
         raise HTTPException(status_code=422, detail="Syllabus does not belong to the selected subject.")
+    if request.syllabus_summary is not None:
+        try:
+            smart_qpg_service.validate_submitted_summary(request.syllabus_summary, syllabus)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
     payload = request.model_dump()
     payload["sections"] = [section.model_dump() for section in request.sections]
     try:
+        create_started = time.perf_counter()
         job_id = smart_qpg_service.create_job(user=user, subject_id=request.subject_id,
-                                              syllabus_id=request.syllabus_id, request=payload)
+                                              syllabus_id=request.syllabus_id, request=payload,
+                                              syllabus_record=syllabus)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+    logger.info("smart_qpg %s", json.dumps({"event": "job_queued", "job_id": job_id,
+        "syllabus_id": request.syllabus_id, "syllabus_retrieval_duration_seconds": round(syllabus_duration, 3),
+        "job_creation_duration_seconds": round(time.perf_counter() - create_started, 3),
+        "total_questions": payload["calculated_total_questions"]}, separators=(",", ":")))
     background_tasks.add_task(smart_qpg_service.start_job, job_id)
     return {"job_id": job_id, "status": "queued", "total_questions": payload["calculated_total_questions"],
             "total_marks": payload["calculated_total_marks"]}
@@ -1450,7 +1463,7 @@ def edit_generated_question(job_id: str, item_id: str, payload: GeneratedQuestio
 @app.post("/api/smart-qpg/generation-jobs/{job_id}/items/{item_id}/regenerate", tags=["question generation"])
 async def regenerate_generated_question(job_id: str, item_id: str,
                                         user: Annotated[str, Depends(require_write_user)]) -> dict:
-    _smart_qpg_job(user, job_id)
+    await asyncio.to_thread(_smart_qpg_job, user, job_id)
     try:
         question = await smart_qpg_service.regenerate_item(job_id, item_id)
     except KeyError as exc:

@@ -1,10 +1,11 @@
-"""Database source of truth for application records and binary artifacts (Turso/libSQL)."""
+"""Database source for Render/Turso and isolated local SQLite development."""
 
 from __future__ import annotations
 
 import json
 import hashlib
 import logging
+import sqlite3
 import uuid
 from datetime import datetime, timezone
 from typing import Any
@@ -166,10 +167,17 @@ class _NormalizedConnection:
 
 def validate_configuration() -> None:
     backend = str(getattr(settings, "DATABASE_BACKEND", "")).casefold()
+    app_env = str(getattr(settings, "APP_ENV", "")).casefold()
+    if backend == "sqlite":
+        if app_env != "local":
+            raise RuntimeError("DATABASE_BACKEND='sqlite' is allowed only when APP_ENV='local'.")
+        if not settings.DATABASE_PATH:
+            raise RuntimeError("DATABASE_PATH must be set for local SQLite development.")
+        return
     if backend != "turso":
-        raise RuntimeError(
-            "DATABASE_BACKEND must be 'turso'; local SQLite is not an application datastore."
-        )
+        raise RuntimeError("DATABASE_BACKEND must be 'turso' or local-only 'sqlite'.")
+    if app_env != "render":
+        raise RuntimeError("DATABASE_BACKEND='turso' is allowed only when APP_ENV='render'.")
     url = str(getattr(settings, "TURSO_DATABASE_URL", "") or "")
     if not url:
         raise RuntimeError("TURSO_DATABASE_URL must be set to the configured Turso database.")
@@ -187,6 +195,15 @@ def validate_configuration() -> None:
 
 def _get_connection():
     validate_configuration()
+    if str(settings.DATABASE_BACKEND).casefold() == "sqlite":
+        path = settings.DATABASE_PATH
+        path.parent.mkdir(parents=True, exist_ok=True)
+        raw = sqlite3.connect(str(path), timeout=30)
+        raw.row_factory = sqlite3.Row
+        conn = _NormalizedConnection(raw)
+        conn.execute("PRAGMA busy_timeout=30000")
+        conn.execute("PRAGMA foreign_keys=ON")
+        return conn
     url = settings.TURSO_DATABASE_URL
     token = settings.TURSO_AUTH_TOKEN
     try:
@@ -345,9 +362,8 @@ def _init_schema(db) -> None:
             last_error TEXT, last_attempt_at TEXT, next_retry_at TEXT,
             updated_at TEXT NOT NULL, PRIMARY KEY(subject, filename, stage)
         )""")
-        # Authentication is performed exclusively against the Turso users table.
-        # Do not seed or overwrite administrator credentials from environment
-        # variables; the database is the single source of truth.
+        # Authentication uses the users table; administrator accounts are never
+        # seeded or overwritten during application startup.
 
 
 def _get_row_value(row, key):
