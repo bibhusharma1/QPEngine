@@ -853,9 +853,6 @@ def reset_question_priority(question_id: str, user: Annotated[str, Depends(requi
 @app.get("/blueprints", tags=["question papers"])
 def list_question_paper_blueprints(user: Annotated[str, Depends(require_user)]) -> dict:
     items = question_papers_service.list_blueprints()
-    allowed = accessible_subjects(user)
-    if allowed is not None:
-        items = [row for row in items if row.get("subject_id") is None or row["subject_id"] in allowed]
     return {"items": items,
             "quick_mark_presets": list(question_papers_service.QUICK_MARK_PRESETS)}
 
@@ -866,15 +863,12 @@ def get_question_paper_blueprint(blueprint_id: str, user: Annotated[str, Depends
     blueprint = question_papers_service.get_blueprint(blueprint_id)
     if blueprint is None:
         raise HTTPException(status_code=404, detail="Blueprint not found")
-    if not subject_allowed(user, blueprint.get("subject_id")):
-        raise HTTPException(status_code=403, detail="Subject access is not assigned to this account")
     return blueprint
 
 
 @app.post("/api/question-paper/blueprints", status_code=201, tags=["question papers"])
 @app.post("/blueprints", status_code=201, tags=["question papers"])
 def create_question_paper_blueprint(payload: dict, user: Annotated[str, Depends(require_write_user)]) -> dict:
-    _require_subject_resource_write(user, payload.get("subject_id"))
     try:
         return question_papers_service.save_blueprint(payload, create=True)
     except FileExistsError as exc:
@@ -890,18 +884,17 @@ def create_question_paper_blueprint(payload: dict, user: Annotated[str, Depends(
 def update_question_paper_blueprint(blueprint_id: str, payload: dict, request: Request,
                                     user: Annotated[str, Depends(require_write_user)]) -> dict:
     """Replace with PUT or merge supplied fields with PATCH."""
+    current = question_papers_service.get_blueprint(blueprint_id)
+    if current is None:
+        raise HTTPException(status_code=404, detail="Blueprint not found")
     if "blueprint_id" in payload and payload["blueprint_id"] != blueprint_id:
         raise HTTPException(status_code=422, detail="Path and body blueprint_id must match")
     if request.method == "PATCH":
-        current = question_papers_service.get_blueprint(blueprint_id)
-        if current is None:
-            raise HTTPException(status_code=404, detail="Blueprint not found")
         current.update(payload)
         payload = current
     if payload.get("blueprint_id", blueprint_id) != blueprint_id:
         raise HTTPException(status_code=422, detail="Path and body blueprint_id must match")
     payload["blueprint_id"] = blueprint_id
-    _require_subject_resource_write(user, payload.get("subject_id"))
     try:
         return question_papers_service.save_blueprint(payload)
     except KeyError as exc:
@@ -919,7 +912,6 @@ def duplicate_question_paper_blueprint(blueprint_id: str, user: Annotated[str, D
         raise HTTPException(status_code=404, detail="Blueprint not found")
     duplicate = dict(source)
     duplicate.update(payload or {})
-    _require_subject_resource_write(user, duplicate.get("subject_id"))
     duplicate.pop("is_default", None)
     duplicate["blueprint_id"] = (payload or {}).get("blueprint_id") or f"{blueprint_id}-copy-{uuid.uuid4().hex[:8]}"
     duplicate["name"] = (payload or {}).get("name") or f"{source['name']} (copy)"
@@ -938,7 +930,6 @@ def delete_question_paper_blueprint(blueprint_id: str, user: Annotated[str, Depe
     source = question_papers_service.get_blueprint(blueprint_id)
     if source is None:
         raise HTTPException(status_code=404, detail="Blueprint not found")
-    _require_subject_resource_write(user, source.get("subject_id"))
     try:
         deleted = question_papers_service.delete_blueprint(blueprint_id)
     except ValueError as exc:

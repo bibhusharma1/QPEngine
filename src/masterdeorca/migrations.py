@@ -10,28 +10,29 @@ from __future__ import annotations
 import sqlite3
 import uuid
 import json
+import logging
 from datetime import datetime, timezone
+
+logger = logging.getLogger(__name__)
 
 
 def add_column_if_missing(db, table: str, column: str, definition: str) -> None:
+    rows = db.execute("SELECT name FROM pragma_table_info(?)", (table,)).fetchall()
+    columns = {row["name"] if hasattr(row, "keys") else row[0] for row in rows}
+    if column in columns:
+        logger.info("DB_MIGRATION_COLUMN_SKIPPED table=%s column=%s reason=already_exists", table, column)
+        return
     try:
-        rows = db.execute(f"PRAGMA table_info({table})").fetchall()
-        columns = set()
-        for row in rows:
-            try:
-                if isinstance(row, dict):
-                    columns.add(row.get("name"))
-                elif hasattr(row, "keys") and "name" in row.keys():
-                    columns.add(row["name"])
-                else:
-                    # tuple format
-                    columns.add(row[1])
-            except Exception:
-                continue
-        if column not in columns:
-            db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+        db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
     except Exception:
-        pass
+        # A second startup may have added this column after our inspection.
+        refreshed = db.execute("SELECT name FROM pragma_table_info(?)", (table,)).fetchall()
+        refreshed_columns = {
+            row["name"] if hasattr(row, "keys") else row[0] for row in refreshed
+        }
+        if column not in refreshed_columns:
+            raise
+        logger.info("DB_MIGRATION_COLUMN_SKIPPED table=%s column=%s reason=concurrent_add", table, column)
 
 
 def _migrate_teacher_subjects(db: sqlite3.Connection) -> None:
@@ -57,6 +58,22 @@ def _migrate_totp_challenge_index(db: sqlite3.Connection) -> None:
 def _migrate_papers_created_by(db: sqlite3.Connection) -> None:
     """Ensure papers.created_by exists for ownership checks (older schemas)."""
     add_column_if_missing(db, "papers", "created_by", "INTEGER REFERENCES users(id)")
+
+
+def _migrate_users_totp_columns(db: sqlite3.Connection) -> None:
+    for column, definition in (
+        ("totp_secret_encrypted", "TEXT"),
+        ("totp_enabled", "INTEGER NOT NULL DEFAULT 0"),
+        ("totp_enrolled", "INTEGER NOT NULL DEFAULT 0"),
+        ("totp_failed_attempts", "INTEGER NOT NULL DEFAULT 0"),
+        ("totp_cooldown_until", "TEXT"),
+        ("totp_last_used_step", "TEXT"),
+    ):
+        add_column_if_missing(db, "users", column, definition)
+
+
+def _migrate_admin_access_mode(db: sqlite3.Connection) -> None:
+    add_column_if_missing(db, "admins", "access_mode", "TEXT NOT NULL DEFAULT 'edit'")
 
 
 def _migrate_unified_backend_entities(db: sqlite3.Connection) -> None:
@@ -677,6 +694,8 @@ MIGRATIONS: tuple[tuple[str, object], ...] = (
     ("smart_qpg_generation_item_source_refs_v1", _migrate_generation_item_source_refs),
     ("canonical_user_roles_v1", _migrate_canonical_user_roles),
     ("smart_qpg_generation_docx_status_v1", _migrate_smart_qpg_docx_status),
+    ("users_totp_columns_v1", _migrate_users_totp_columns),
+    ("admin_access_mode_v1", _migrate_admin_access_mode),
 )
 
 
@@ -690,9 +709,16 @@ def run_migrations(db: sqlite3.Connection) -> None:
             "SELECT 1 FROM schema_migrations WHERE version=?", (version,)
         ).fetchone()
         if applied:
+            logger.info("DB_MIGRATION_SKIPPED version=%s reason=already_applied", version)
             continue
-        step(db)
-        db.execute(
-            "INSERT INTO schema_migrations(version, applied_at) VALUES (?,datetime('now'))",
-            (version,),
-        )
+        logger.info("DB_MIGRATION_START version=%s", version)
+        try:
+            step(db)
+            db.execute(
+                "INSERT INTO schema_migrations(version, applied_at) VALUES (?,datetime('now'))",
+                (version,),
+            )
+        except Exception:
+            logger.exception("DB_MIGRATION_FAILED version=%s", version)
+            raise
+        logger.info("DB_MIGRATION_APPLIED version=%s", version)

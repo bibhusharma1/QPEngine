@@ -1,6 +1,7 @@
 import asyncio
 import json
 import sqlite3
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -77,9 +78,14 @@ def test_create_job_uses_entire_syllabus_even_with_legacy_module_selection(monke
         def execute(self, statement, params=()):
             statements.append((statement, params))
 
+        def executemany(self, statement, rows):
+            statements.append((statement, list(rows)))
+
     monkeypatch.setattr(smart_qpg, "get_syllabus", lambda _syllabus_id: syllabus)
     monkeypatch.setattr(smart_qpg.database, "get_subject_by_id", lambda _subject_id: {"subject_name": "Test"})
     monkeypatch.setattr(smart_qpg.database, "connect", lambda: FakeDatabaseConnection())
+    monkeypatch.setattr(smart_qpg.database, "run_transaction",
+                        lambda operation, **_kwargs: operation(FakeDatabaseConnection()))
     request = {
         "selected_modules": modules,
         "instructions": "Answer all questions",
@@ -89,7 +95,13 @@ def test_create_job_uses_entire_syllabus_even_with_legacy_module_selection(monke
     }
     job_id = smart_qpg.create_job(user="teacher", subject_id="subject-1", syllabus_id="syllabus-1", request=request)
     assert job_id
-    item_inserts = [params for statement, params in statements if "INSERT INTO question_generation_items" in statement]
+    second_job_id = smart_qpg.create_job(user="teacher", subject_id="subject-1", syllabus_id="syllabus-1",
+                                         request=json.loads(json.dumps(request)))
+    assert second_job_id != job_id
+    assert len([1 for statement, _params in statements
+                if "INSERT INTO question_generation_jobs" in statement]) == 2
+    item_inserts = next(params for statement, params in statements
+                        if "INSERT INTO question_generation_items" in statement)
     assert len(item_inserts) == 8
     assert {params[7] for params in item_inserts} == {f"Module {roman}" for roman in ("I", "II", "III", "IV")}
     job_insert = next(params for statement, params in statements if "INSERT INTO question_generation_jobs" in statement)
@@ -238,6 +250,28 @@ def test_transient_generation_errors_retry_with_shared_question_budget(monkeypat
     assert diagnostics["generation_attempts"] == 3 and diagnostics["retries_used"] == 2
 
 
+def test_database_retry_progress_failure_does_not_consume_model_retry(monkeypatch):
+    monkeypatch.setattr(smart_qpg.settings, "QUESTION_GENERATION_MAX_RETRIES", 2)
+    calls = 0
+
+    async def fake_batch(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        raise smart_qpg._GenerationRequestError("server_error", "temporary model response failure",
+                                                retryable=True)
+
+    async def failed_progress(*_args):
+        raise smart_qpg._DatabasePersistenceError("progress write failed")
+
+    monkeypatch.setattr(smart_qpg, "_generate_batch", fake_batch)
+    diagnostics = {}
+    with pytest.raises(smart_qpg._DatabasePersistenceError):
+        asyncio.run(smart_qpg._generate_one(None, {"job_id": "j"}, None, {"item_id": "i"}, [], [],
+                                            asyncio.Lock(), diagnostics, on_retry=failed_progress))
+    assert calls == 1
+    assert diagnostics["failure_category"] == "database_persistence"
+
+
 def test_permanent_request_errors_are_not_retried(monkeypatch, syllabus):
     monkeypatch.setattr(smart_qpg.settings, "QUESTION_GENERATION_MAX_RETRIES", 2)
     calls = []
@@ -361,16 +395,108 @@ def test_submitted_syllabus_summary_must_match_stored_summary(syllabus):
         smart_qpg.validate_submitted_summary(modified, syllabus)
 
 
-def test_generation_request_identity_ignores_runtime_and_selection_fields():
-    first = {"paper_title": "Midterm", "sections": [{"name": "A"}],
-             "selected_modules": ["Module I"], "syllabus_summary": {"modules": []},
-             "generation_context_id": "one"}
-    second = {"paper_title": "Midterm", "sections": [{"name": "A"}],
-              "selected_modules": ["Module IV"], "syllabus_summary": {"modules": ["changed"]},
-              "generation_context_id": "two", "resolved_scope": [{"topic": "runtime"}]}
-    changed_exam = {**second, "paper_title": "Final"}
-    assert smart_qpg._generation_request_identity(first) == smart_qpg._generation_request_identity(second)
-    assert smart_qpg._generation_request_identity(first) != smart_qpg._generation_request_identity(changed_exam)
+def test_repeated_generation_jobs_keep_questions_and_docx_per_job(monkeypatch, syllabus):
+    from src.masterdeorca import app as app_module
+
+    db = sqlite3.connect(":memory:", check_same_thread=False)
+    db.row_factory = sqlite3.Row
+    db.executescript("""
+        CREATE TABLE subjects(subject_id TEXT, subject_name TEXT);
+        CREATE TABLE question_generation_jobs(job_id TEXT, created_by TEXT, subject_id TEXT, syllabus_id TEXT,
+            status TEXT, request_json TEXT, progress_json TEXT, error TEXT, docx_blob BLOB,
+            docx_error TEXT, created_at TEXT, updated_at TEXT);
+        CREATE TABLE question_generation_items(item_id TEXT, job_id TEXT, section TEXT, topic TEXT, marks INTEGER,
+            type TEXT, difficulty TEXT, source_module TEXT, source_heading TEXT, position INTEGER, status TEXT,
+            question_json TEXT, error TEXT, retries INTEGER DEFAULT 0, created_at TEXT, updated_at TEXT);
+        CREATE TABLE generated_papers(paper_id TEXT, subject_name TEXT, storage_key TEXT, paper_json TEXT,
+            docx_blob BLOB, created_at TEXT, updated_at TEXT);
+    """)
+    db.execute("INSERT INTO subjects VALUES(?,?)", ("subject-1", "Test"))
+    db.commit()
+    lock = threading.Lock()
+
+    def db_operation(operation, **_kwargs):
+        with lock:
+            return operation(db)
+
+    monkeypatch.setattr(smart_qpg.database, "connect", lambda *_args, **_kwargs: db)
+    monkeypatch.setattr(smart_qpg.database, "run_transaction", db_operation)
+    monkeypatch.setattr(smart_qpg.database, "run_autocommit", db_operation)
+    monkeypatch.setattr(smart_qpg.database, "get_subject_by_id", lambda _id: {"subject_name": "Test"})
+    monkeypatch.setattr(smart_qpg, "_existing_examples", lambda *_args: ([], []))
+    monkeypatch.setattr(smart_qpg.settings, "QUESTION_GENERATION_CONCURRENCY", 3)
+    monkeypatch.setattr(smart_qpg.settings, "QUESTION_GENERATION_BATCH_SIZE", 1)
+    monkeypatch.setattr(smart_qpg.settings, "QUESTION_GENERATION_OUTPUT_RETRIES", 1)
+    monkeypatch.setattr(smart_qpg.settings, "QUESTION_GENERATION_API_ATTEMPTS", 1)
+    monkeypatch.setattr(smart_qpg.settings, "QUESTION_GENERATION_MAX_RETRIES", 1)
+
+    async def create(**kwargs):
+        task = json.loads(kwargs["messages"][1]["content"])
+        forms = [
+            "Define {topic}: explain its purpose and the conditions under which it is used.",
+            "Compare {topic} with a competing technique, then discuss reliability and cost tradeoffs.",
+            "Trace how {topic} responds to an input event and describe the resulting system state.",
+            "Evaluate the role of {topic} in resource allocation, including one limitation.",
+            "Propose a design that applies {topic} to solve a practical computing problem.",
+            "Analyze a failure scenario involving {topic} and explain how the system can recover.",
+            "Distinguish {topic} from adjacent concepts using an example and state when it matters.",
+            "Predict the effect of changing {topic}'s operating conditions and justify the prediction.",
+        ]
+        roman_index = {"I": 0, "II": 1, "III": 2, "IV": 3}
+        questions = []
+        for item in task["assignments"]:
+            topic_number = int(item["topic"][-1]) - 1
+            form_index = roman_index[item["module"].removeprefix("Module ")] * 2 + topic_number
+            questions.append({"question_text": forms[form_index].format(topic=item["topic"])})
+        return SimpleNamespace(choices=[SimpleNamespace(
+            finish_reason="stop", message=SimpleNamespace(content=json.dumps({"questions": questions}))
+        )])
+
+    class FakeClient:
+        async def close(self):
+            return None
+
+    FakeClient.chat = SimpleNamespace(completions=SimpleNamespace(create=create))
+    monkeypatch.setattr(smart_qpg, "_nvidia_client", FakeClient)
+
+    def request(question_count):
+        return {"paper_title": f"Paper {question_count}", "duration": "30 minutes",
+                "total_marks": question_count * 5,
+                "sections": [{"name": "A", "question_count": question_count,
+                              "marks_per_question": 5, "question_type": "Short", "difficulty": "Easy"}]}
+
+    job_three = smart_qpg.create_job(user="teacher", subject_id="subject-1", syllabus_id="syllabus-1",
+                                     request=request(3), syllabus_record=syllabus)
+    asyncio.run(smart_qpg.run_job(job_three))
+    first = smart_qpg.get_job(job_three)
+    assert first["status"] == "completed" and first["completed_questions"] == 3 and first["docx_ready"]
+    first_questions = [item["question"]["question_text"] for item in first["items"]]
+    with lock:
+        first_docx = bytes(db.execute("SELECT docx_blob FROM question_generation_jobs WHERE job_id=?",
+                                      (job_three,)).fetchone()[0])
+
+    job_five = smart_qpg.create_job(user="teacher", subject_id="subject-1", syllabus_id="syllabus-1",
+                                    request=request(5), syllabus_record=syllabus)
+    assert job_five != job_three
+    asyncio.run(smart_qpg.run_job(job_five))
+    second = smart_qpg.get_job(job_five)
+    assert second["status"] == "completed" and second["completed_questions"] == 5 and second["docx_ready"]
+    assert smart_qpg.get_job(job_three)["items"][0]["question"]["question_text"] == first_questions[0]
+    with lock:
+        assert bytes(db.execute("SELECT docx_blob FROM question_generation_jobs WHERE job_id=?",
+                                (job_three,)).fetchone()[0]) == first_docx
+        assert db.execute("SELECT COUNT(*) FROM generated_papers WHERE paper_id IN (?,?)",
+                          (job_three, job_five)).fetchone()[0] == 2
+
+    monkeypatch.setattr(app_module, "_smart_qpg_job", lambda _user, target: smart_qpg.get_job(target))
+    first_download = app_module.download_generated_question_paper(job_three, "teacher")
+    assert first_download.body == first_docx
+    third = smart_qpg.create_job(user="teacher", subject_id="subject-1", syllabus_id="syllabus-1",
+                                 request=request(1), syllabus_record=syllabus)
+    assert third not in {job_three, job_five}
+    assert smart_qpg.get_job(third)["status"] == "queued"
+    asyncio.run(smart_qpg.run_job(third))
+    assert smart_qpg.get_job(third)["status"] == "completed"
 
 
 @pytest.mark.parametrize(("fail_topics", "expected_status", "expected_drafts", "expected_failures"), [
@@ -387,27 +513,54 @@ def test_run_job_persists_questions_and_terminal_states(monkeypatch, fail_topics
         CREATE TABLE subjects(subject_id TEXT, subject_name TEXT);
         CREATE TABLE question_generation_jobs(job_id TEXT, created_by TEXT, subject_id TEXT, syllabus_id TEXT,
             status TEXT, request_json TEXT, progress_json TEXT, error TEXT, docx_blob BLOB,
-            created_at TEXT, updated_at TEXT);
+            docx_error TEXT, created_at TEXT, updated_at TEXT);
         CREATE TABLE question_generation_items(item_id TEXT, job_id TEXT, section TEXT, topic TEXT, marks INTEGER,
             type TEXT, difficulty TEXT, source_module TEXT, source_heading TEXT, position INTEGER, status TEXT,
-            question_json TEXT, error TEXT, retries INTEGER, created_at TEXT, updated_at TEXT);
+            question_json TEXT, error TEXT, retries INTEGER DEFAULT 0, created_at TEXT, updated_at TEXT);
+        CREATE TABLE generated_papers(paper_id TEXT, subject_name TEXT, storage_key TEXT, paper_json TEXT,
+            docx_blob BLOB, created_at TEXT, updated_at TEXT);
     """)
-    request = {"sections": [{"name": "A", "instructions": ""}], "resolved_scope": [],
-               "resolved_guidance": {}, "instructions": []}
+    request = {"sections": [{"name": "A", "instructions": "", "question_count": 2,
+                              "marks_per_question": 5}], "resolved_scope": [],
+               "resolved_guidance": {}, "instructions": [], "calculated_total_questions": 2,
+               "calculated_total_marks": 10, "total_marks": 10, "duration": "20 minutes"}
     db.execute("INSERT INTO subjects VALUES(?,?)", ("s", "Test"))
-    db.execute("INSERT INTO question_generation_jobs VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-               ("j", "teacher", "s", "y", "queued", json.dumps(request), "{}", None, None, "t", "t"))
+    db.execute("INSERT INTO question_generation_jobs VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+               ("j", "teacher", "s", "y", "queued", json.dumps(request), "{}", None, None, None, "t", "t"))
     for index, topic in enumerate(("Topic I1", "Topic I2")):
         db.execute("INSERT INTO question_generation_items VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                    (f"i{index}", "j", "A", topic, 5, "Short", "Easy", "Module I", "Section IA",
                     index, "queued", None, None, 0, "t", "t"))
     db.commit()
     monkeypatch.setattr(smart_qpg.database, "connect", lambda: db)
+    db_lock = threading.Lock()
+
+    def run_fake_db_operation(operation, **_kwargs):
+        with db_lock:
+            return operation(db)
+
+    monkeypatch.setattr(smart_qpg.database, "run_transaction", run_fake_db_operation)
+    progress_failures = 1
+
+    def run_autocommit(operation, *, operation_name=""):
+        nonlocal progress_failures
+        with db_lock:
+            persisted_states = db.execute(
+                "SELECT COUNT(*) FROM question_generation_items WHERE job_id='j' "
+                "AND (status='failed' OR (status='draft' AND question_json IS NOT NULL))"
+            ).fetchone()[0]
+        if (expected_drafts and operation_name == "smart_qpg_update_progress"
+                and progress_failures and persisted_states):
+            progress_failures -= 1
+            raise RuntimeError("transient progress write failure")
+        return run_fake_db_operation(operation)
+
+    monkeypatch.setattr(smart_qpg.database, "run_autocommit", run_autocommit)
     monkeypatch.setattr(smart_qpg, "_existing_examples", lambda *_args: ([], []))
     monkeypatch.setattr(smart_qpg.settings, "QUESTION_GENERATION_OUTPUT_RETRIES", 1)
     monkeypatch.setattr(smart_qpg.settings, "QUESTION_GENERATION_API_ATTEMPTS", 1)
     monkeypatch.setattr(smart_qpg.settings, "QUESTION_GENERATION_MAX_RETRIES", 1)
-    monkeypatch.setattr(smart_qpg.settings, "QUESTION_GENERATION_CONCURRENCY", 1)
+    monkeypatch.setattr(smart_qpg.settings, "QUESTION_GENERATION_CONCURRENCY", 3)
     monkeypatch.setattr(smart_qpg.settings, "QUESTION_GENERATION_BATCH_SIZE", 2)
     model_batches = []
 
@@ -434,6 +587,7 @@ def test_run_job_persists_questions_and_terminal_states(monkeypatch, fail_topics
     FakeClient.chat = SimpleNamespace(completions=SimpleNamespace(create=create))
     monkeypatch.setattr(smart_qpg, "_nvidia_client", FakeClient)
     asyncio.run(smart_qpg.run_job("j"))
+    assert progress_failures == (0 if expected_drafts else 1)
     db.commit()
     job = db.execute("SELECT status,progress_json FROM question_generation_jobs WHERE job_id='j'").fetchone()
     statuses = [row["status"] for row in db.execute("SELECT status FROM question_generation_items WHERE job_id='j'")]
@@ -456,8 +610,8 @@ def test_run_job_persists_questions_and_terminal_states(monkeypatch, fail_topics
         assert not smart_qpg.retry_job("j")
         asyncio.run(smart_qpg.run_job("j"))
         retried_topics = [batch[0] for batch in model_batches[attempts_before_retry:]]
-        assert retried_topics == [topic for topic in ("Topic I1", "Topic I2")
-                                  if topic in initially_failed_topics]
+        assert sorted(retried_topics) == sorted(topic for topic in ("Topic I1", "Topic I2")
+                                                if topic in initially_failed_topics)
         assert db.execute("SELECT COUNT(*) FROM question_generation_items WHERE job_id='j' AND status='draft'").fetchone()[0] == 2
 
 
@@ -480,6 +634,8 @@ def test_item_status_updates_keep_persisted_progress_and_poll_counts_in_sync(mon
                     "queued", None, None, 0, "t", "t"))
     db.commit()
     monkeypatch.setattr(smart_qpg.database, "connect", lambda: db)
+    monkeypatch.setattr(smart_qpg.database, "run_transaction", lambda operation, **_kwargs: operation(db))
+    monkeypatch.setattr(smart_qpg.database, "run_autocommit", lambda operation, **_kwargs: operation(db))
 
     running = smart_qpg._set_item_state("j", "i1", "running")
     assert running["queued"] == 1 and running["running"] == 1
@@ -503,5 +659,46 @@ def test_only_one_worker_can_claim_a_queued_job(monkeypatch):
     db.execute("INSERT INTO question_generation_jobs VALUES('j','queued','t')")
     db.commit()
     monkeypatch.setattr(smart_qpg.database, "connect", lambda: db)
+    monkeypatch.setattr(smart_qpg.database, "run_transaction", lambda operation, **_kwargs: operation(db))
     assert smart_qpg._claim_job("j")
     assert not smart_qpg._claim_job("j")
+
+
+def test_run_autocommit_uses_fresh_statement_transactions_on_local_sqlite(tmp_path, monkeypatch):
+    from src.masterdeorca import database
+
+    monkeypatch.setattr(database.settings, "DATABASE_BACKEND", "sqlite")
+    monkeypatch.setattr(database.settings, "APP_ENV", "local")
+    monkeypatch.setattr(database.settings, "DATABASE_PATH", tmp_path / "autocommit.sqlite")
+    database.run_autocommit(lambda db: db.execute("CREATE TABLE progress(value INTEGER)"),
+                            operation_name="test_create_progress")
+    database.run_autocommit(lambda db: db.execute("INSERT INTO progress VALUES(1)"),
+                            operation_name="test_write_progress")
+    with database.connect("test_read_progress") as db:
+        assert db.execute("SELECT value FROM progress").fetchone()[0] == 1
+
+
+def test_turso_autocommit_is_passed_to_installed_libsql_connect(monkeypatch):
+    import libsql
+    from src.masterdeorca import database
+
+    real_connect = libsql.connect
+    calls = []
+
+    def memory_turso_connection(url, **options):
+        calls.append((url, options))
+        return real_connect(":memory:", **options)
+
+    monkeypatch.setattr(database.settings, "DATABASE_BACKEND", "turso")
+    monkeypatch.setattr(database.settings, "APP_ENV", "render")
+    monkeypatch.setattr(database.settings, "TURSO_DATABASE_URL", "libsql://qp-bibhusharma1.example.turso.io")
+    monkeypatch.setattr(database.settings, "TURSO_AUTH_TOKEN", "test-token")
+    monkeypatch.setattr(libsql, "connect", memory_turso_connection)
+
+    with database.connect("test_turso_autocommit", autocommit=True) as db:
+        assert db.execute("SELECT 1").fetchone()[0] == 1
+        db.execute("CREATE TABLE progress(value INTEGER)")
+        db.execute("INSERT INTO progress VALUES(1)")
+        assert db.execute("SELECT value FROM progress").fetchone()[0] == 1
+    assert calls == [("libsql://qp-bibhusharma1.example.turso.io",
+                      {"auth_token": "test-token", "isolation_level": None})]

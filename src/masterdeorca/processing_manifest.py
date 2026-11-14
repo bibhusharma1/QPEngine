@@ -74,32 +74,15 @@ def _save(subject: str, manifest: dict) -> None:
         raise ValueError(f"Unknown subject {subject!r}")
     manifest["updated_at"] = _now()
 
-    def _write():
-        with database.connect() as db:
-            db.execute(
-                """INSERT INTO processing_manifests(subject_id,manifest_json,updated_at)
-                   VALUES(?,?,?) ON CONFLICT(subject_id) DO UPDATE SET
-                   manifest_json=excluded.manifest_json,updated_at=excluded.updated_at""",
-                (subject_id, json.dumps(manifest, ensure_ascii=False), manifest["updated_at"]),
-            )
-            # Commit failures must reach the caller. The connection context
-            # manager will only roll back if libsql still reports an active
-            # transaction, while preserving this original exception.
-            db.commit()
+    def _write(db):
+        db.execute(
+            """INSERT INTO processing_manifests(subject_id,manifest_json,updated_at)
+               VALUES(?,?,?) ON CONFLICT(subject_id) DO UPDATE SET
+               manifest_json=excluded.manifest_json,updated_at=excluded.updated_at""",
+            (subject_id, json.dumps(manifest, ensure_ascii=False), manifest["updated_at"]),
+        )
 
-    attempts = 5
-    last_error = None
-    for attempt in range(1, attempts + 1):
-        try:
-            _write()
-            return
-        except Exception as exc:
-            last_error = exc
-            if not _is_busy(exc) or attempt >= attempts:
-                raise
-            time.sleep(min(0.05 * (2 ** (attempt - 1)), 1.0))
-    if last_error is not None:
-        raise last_error
+    database.run_transaction(_write, operation_name="save_processing_manifest")
 
 
 def load_subject(subject: str) -> dict:

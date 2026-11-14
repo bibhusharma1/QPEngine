@@ -31,6 +31,8 @@ API_PORT = int(setting("QUES_PORT", "8000"))
 DATABASE_BACKEND = setting("DATABASE_BACKEND", "turso").casefold()
 # Local SQLite runtime database path; Render uses Turso instead.
 DATABASE_PATH = resolve_path(setting("DATABASE_PATH", str(PROJECT_ROOT / "data" / "masterdeorca.sqlite") if APP_ENV == "local" else "/data/masterdeorca.sqlite"))
+DATABASE_BUSY_RETRIES = max(1, int(setting("DATABASE_BUSY_RETRIES", "5")))
+DATABASE_BUSY_BACKOFF_BASE = max(0.01, float(setting("DATABASE_BUSY_BACKOFF_BASE", "0.05")))
 _storage_backend = setting("STORAGE_BACKEND", "sqlite").casefold()
 STORAGE_BACKEND = "sqlite" if _storage_backend == "local" else _storage_backend
 TURSO_DATABASE_URL = setting("TURSO_DATABASE_URL", "")

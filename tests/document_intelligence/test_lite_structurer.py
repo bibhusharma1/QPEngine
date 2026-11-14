@@ -161,6 +161,50 @@ def test_zero_questions_with_explicit_heading_gets_targeted_correction(monkeypat
     assert result["questions"][0]["question_number"] == "Q1"
 
 
+def test_omitted_block_reference_keeps_partial_validated_result(monkeypatch):
+    from src.masterdeorca.document_intelligence.lite.structurer import BlockReferenceValidationError
+
+    requests = []
+    _mock_responses(monkeypatch, [{
+        "questions": [{"question_number": "Q1", "block_ids": ["b1"]}],
+    }], requests)
+    monkeypatch.setenv("NVIDIA_API_KEY", "test-nvidia-api")
+    monkeypatch.setattr("config.settings.NVIDIA_STRUCTURE_RETRIES", 1)
+
+    with pytest.raises(BlockReferenceValidationError) as error:
+        StructureWithLLM().classify_blocks(
+            [
+                {"block_id": "b1", "page_number": 1, "text": "Q.1 Explain."},
+                {"block_id": "b2", "page_number": 1, "text": "Continuation."},
+            ],
+            [], batch_id="omitted-batch",
+        )
+
+    assert error.value.omitted_blocks == ["b2"]
+    assert error.value.partial_result["questions"][0]["block_ids"] == ["b1"]
+    assert len(requests) == 1
+
+
+def test_fabricated_block_reference_has_no_recoverable_partial_result(monkeypatch):
+    from src.masterdeorca.document_intelligence.lite.structurer import BlockReferenceValidationError
+
+    requests = []
+    _mock_responses(monkeypatch, [{
+        "questions": [{"question_number": "Q1", "block_ids": ["not-in-request"]}],
+    }], requests)
+    monkeypatch.setenv("NVIDIA_API_KEY", "test-nvidia-api")
+    monkeypatch.setattr("config.settings.NVIDIA_STRUCTURE_RETRIES", 1)
+
+    with pytest.raises(BlockReferenceValidationError) as error:
+        StructureWithLLM().classify_blocks(
+            [{"block_id": "b1", "page_number": 1, "text": "Q.1 Explain."}],
+            [], batch_id="fabricated-batch",
+        )
+
+    assert error.value.invalid_blocks == ["not-in-request"]
+    assert error.value.partial_result is None
+
+
 def test_length_null_content_is_left_for_adaptive_split(monkeypatch):
     requests = []
     truncated = httpx.Response(200, json={

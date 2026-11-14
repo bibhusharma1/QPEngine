@@ -5,7 +5,10 @@ from __future__ import annotations
 import json
 import hashlib
 import logging
+import random
 import sqlite3
+import threading
+import time
 import uuid
 from datetime import datetime, timezone
 from typing import Any
@@ -20,6 +23,7 @@ from src.masterdeorca import migrations
 _password_hash = PasswordHash.recommended()
 _logger = logging.getLogger(__name__)
 _SUBJECT_ID_NAMESPACE = uuid.UUID("bf54f1f5-1d81-4c12-8d70-29b7a414a0e2")
+_write_transaction_lock = threading.RLock()
 
 
 class _NormalizedRow(dict):
@@ -119,46 +123,138 @@ class _NormalizedCursor:
 
 
 class _NormalizedConnection:
-    def __init__(self, connection):
+    def __init__(self, connection, operation: str = "database", *, autocommit: bool = False):
         self._connection = connection
+        self._operation = operation
+        self._autocommit = autocommit
+        self._connection_id = uuid.uuid4().hex[:10]
+        self._expired = False
+
+    def _ensure_usable(self):
+        if self._expired:
+            raise RuntimeError("The database connection belongs to an expired Hrana stream; open a fresh connection.")
 
     def execute(self, *args, **kwargs):
-        return _NormalizedCursor(self._connection.execute(*args, **kwargs))
+        self._ensure_usable()
+        sql = " ".join(str(args[0]).split())[:240] if args else "<unknown SQL>"
+        before = bool(getattr(self._connection, "in_transaction", False))
+        try:
+            cursor = self._connection.execute(*args, **kwargs)
+        except Exception as exc:
+            if _is_expired_stream_error(exc):
+                self._expired = True
+            _logger.error(
+                "DB_SQL_FAILED operation=%s connection=%s in_transaction=%s sql=%r error=%s: %s",
+                self._operation, self._connection_id, before, sql, type(exc).__name__, exc,
+            )
+            raise
+        after = bool(getattr(self._connection, "in_transaction", False))
+        if not before and after:
+            _logger.debug("DB_TX_START operation=%s connection=%s sql=%r", self._operation, self._connection_id, sql)
+        if after or _is_write_sql(sql):
+            _logger.debug("DB_SQL_OK operation=%s connection=%s in_transaction=%s sql=%r", self._operation, self._connection_id, after, sql)
+        return _NormalizedCursor(cursor)
 
     def executemany(self, *args, **kwargs):
-        return self._connection.executemany(*args, **kwargs)
+        self._ensure_usable()
+        try:
+            return self._connection.executemany(*args, **kwargs)
+        except Exception as exc:
+            if _is_expired_stream_error(exc): self._expired = True
+            raise
 
     def executescript(self, *args, **kwargs):
-        return self._connection.executescript(*args, **kwargs)
+        self._ensure_usable()
+        try:
+            return self._connection.executescript(*args, **kwargs)
+        except Exception as exc:
+            if _is_expired_stream_error(exc): self._expired = True
+            raise
 
     def commit(self):
-        return self._connection.commit()
+        self._ensure_usable()
+        _logger.debug("DB_COMMIT_START operation=%s connection=%s", self._operation, self._connection_id)
+        try:
+            result = self._connection.commit()
+        except Exception as exc:
+            if _is_expired_stream_error(exc): self._expired = True
+            _logger.exception("DB_COMMIT_FAILED operation=%s connection=%s", self._operation, self._connection_id)
+            raise
+        _logger.debug("DB_COMMIT_OK operation=%s connection=%s", self._operation, self._connection_id)
+        return result
 
     def close(self):
         return self._connection.close()
+
+    def rollback(self):
+        self._ensure_usable()
+        try:
+            return self._connection.rollback()
+        except Exception as exc:
+            if _is_expired_stream_error(exc): self._expired = True
+            raise
 
     def __enter__(self):
         # Own context handling here. libsql's Connection.__exit__ performs
         # its own transaction cleanup, which can issue ROLLBACK after an
         # explicit commit has already ended the transaction.
+        _logger.debug("DB_TX_SCOPE_START operation=%s connection=%s", self._operation, self._connection_id)
         return self
 
     def __exit__(self, exc_type, exc, traceback):
-        if exc_type is not None:
-            # Preserve the operation's exception even if cleanup also fails.
-            _logger.error(
-                "Database operation failed; attempting rollback: %s: %s",
-                exc_type.__name__, exc,
-                exc_info=(exc_type, exc, traceback),
-            )
-            if bool(getattr(self._connection, "in_transaction", False)):
-                try:
-                    self._connection.rollback()
-                except Exception:
-                    _logger.exception("Database rollback failed while preserving original exception")
+        if self._autocommit:
+            # Each statement has already committed. Do not call commit() or
+            # rollback(), which can open another transaction on some drivers.
+            try:
+                self._connection.close()
+                _logger.debug("DB_CONNECTION_CLOSED operation=%s connection=%s autocommit=true",
+                              self._operation, self._connection_id)
+            except Exception:
+                _logger.exception("DB_CONNECTION_CLOSE_FAILED operation=%s connection=%s",
+                                   self._operation, self._connection_id)
             return False
-        if bool(getattr(self._connection, "in_transaction", False)):
-            self._connection.commit()
+        try:
+            if exc_type is not None:
+                _logger.error(
+                    "DB_TX_ROLLBACK_START operation=%s connection=%s error=%s: %s",
+                    self._operation, self._connection_id, exc_type.__name__, exc,
+                    exc_info=(exc_type, exc, traceback),
+                )
+                if self._expired or _transaction_already_rolled_back(exc):
+                    _logger.warning(
+                        "DB_TX_SERVER_ROLLBACK operation=%s connection=%s reason=interactive_transaction_expired",
+                        self._operation, self._connection_id,
+                    )
+                elif bool(getattr(self._connection, "in_transaction", False)):
+                    try:
+                        self.rollback()
+                        _logger.debug("DB_TX_ROLLBACK_OK operation=%s connection=%s", self._operation, self._connection_id)
+                    except Exception:
+                        _logger.exception("DB_TX_ROLLBACK_FAILED operation=%s connection=%s", self._operation, self._connection_id)
+                return False
+            # Commit unconditionally: some libSQL connection implementations
+            # do not expose a reliable in_transaction flag for implicit
+            # interactive transactions opened by reads as well as writes.
+            self.commit()
+        except Exception as commit_exc:
+            if self._expired or _transaction_already_rolled_back(commit_exc):
+                _logger.warning(
+                    "DB_TX_SERVER_ROLLBACK operation=%s connection=%s reason=interactive_transaction_expired during=commit",
+                    self._operation, self._connection_id,
+                )
+            elif bool(getattr(self._connection, "in_transaction", False)):
+                try:
+                    self.rollback()
+                    _logger.debug("DB_TX_ROLLBACK_OK operation=%s connection=%s after_commit_failure=true", self._operation, self._connection_id)
+                except Exception:
+                    _logger.exception("DB_TX_ROLLBACK_FAILED operation=%s connection=%s after_commit_failure=true", self._operation, self._connection_id)
+            raise
+        finally:
+            try:
+                self._connection.close()
+                _logger.debug("DB_CONNECTION_CLOSED operation=%s connection=%s", self._operation, self._connection_id)
+            except Exception:
+                _logger.exception("DB_CONNECTION_CLOSE_FAILED operation=%s connection=%s", self._operation, self._connection_id)
         return False
 
     def __getattr__(self, name):
@@ -193,14 +289,21 @@ def validate_configuration() -> None:
         )
 
 
-def _get_connection():
+def _is_write_sql(sql: str) -> bool:
+    first = sql.lstrip().split(None, 1)[0].upper() if sql.strip() else ""
+    return first in {"INSERT", "UPDATE", "DELETE", "REPLACE", "CREATE", "ALTER", "DROP", "BEGIN", "COMMIT", "ROLLBACK"}
+
+
+def _get_connection(operation: str = "database", *, autocommit: bool = False):
     validate_configuration()
     if str(settings.DATABASE_BACKEND).casefold() == "sqlite":
         path = settings.DATABASE_PATH
         path.parent.mkdir(parents=True, exist_ok=True)
         raw = sqlite3.connect(str(path), timeout=30)
         raw.row_factory = sqlite3.Row
-        conn = _NormalizedConnection(raw)
+        if autocommit:
+            raw.isolation_level = None
+        conn = _NormalizedConnection(raw, operation, autocommit=autocommit)
         conn.execute("PRAGMA busy_timeout=30000")
         conn.execute("PRAGMA foreign_keys=ON")
         return conn
@@ -211,20 +314,22 @@ def _get_connection():
     except Exception as exc:
         raise RuntimeError("Turso libSQL client is unavailable; install the backend dependencies.") from exc
     try:
-        raw = libsql.connect(url, auth_token=token)
+        connect_options = {"auth_token": token}
+        if autocommit:
+            # Configure statement-level transactions at creation; the
+            # installed builtins.Connection does not allow changing this
+            # attribute after construction.
+            connect_options["isolation_level"] = None
+        raw = libsql.connect(url, **connect_options)
     except Exception as exc:
         # Never include the URL or token in an error that could reach logs/API output.
         raise RuntimeError(
             f"Unable to connect to the configured Turso database ({type(exc).__name__}). "
             "Check Turso URL, token, network access, and database availability."
         ) from exc
-    conn = _NormalizedConnection(raw)
-    for pragma in ("PRAGMA busy_timeout=30000", "PRAGMA foreign_keys=ON"):
-        try:
-            conn.execute(pragma)
-        except Exception:
-            pass
-    return conn
+    # Hrana does not accept connection PRAGMAs. Keep Turso setup SQL-free;
+    # local-only PRAGMAs are applied in the sqlite branch above.
+    return _NormalizedConnection(raw, operation, autocommit=autocommit)
 
 
 def _is_busy_error(exc: Exception) -> bool:
@@ -232,39 +337,90 @@ def _is_busy_error(exc: Exception) -> bool:
     return any(marker in message for marker in ("busy", "locked", "idle transaction", "database is locked"))
 
 
-def _retry_db(operation, attempts: int = 5, base_delay: float = 0.05):
-    import time
+def _transaction_already_rolled_back(exc: BaseException | None) -> bool:
+    """Hrana expires idle interactive transactions server-side; rollback then fails too."""
+    message = str(exc or "").casefold()
+    return ("interactive transaction was rolled back" in message
+            or "stream was idle for too long" in message
+            or "no transaction is active" in message)
+
+
+def _is_expired_stream_error(exc: BaseException | None) -> bool:
+    message = str(exc or "").casefold()
+    return (_transaction_already_rolled_back(exc)
+            or "stream not found" in message
+            or "stream was not found" in message)
+
+
+def _retry_db(operation, attempts: int | None = None, base_delay: float | None = None, operation_name: str = "database_write"):
+    attempts = max(1, int(attempts or getattr(settings, "DATABASE_BUSY_RETRIES", 5)))
+    base_delay = max(0.01, float(base_delay or getattr(settings, "DATABASE_BUSY_BACKOFF_BASE", 0.05)))
     last_error = None
-    for attempt in range(1, attempts + 1):
-        try:
-            return operation()
-        except Exception as exc:
-            last_error = exc
-            if not _is_busy_error(exc) or attempt >= attempts:
-                raise
-            time.sleep(min(base_delay * (2 ** (attempt - 1)), 1.0))
+    with _write_transaction_lock:
+        for attempt in range(1, attempts + 1):
+            try:
+                return operation()
+            except Exception as exc:
+                last_error = exc
+                if not (_is_busy_error(exc) or _is_expired_stream_error(exc)) or attempt >= attempts:
+                    raise
+                delay = min(base_delay * (2 ** (attempt - 1)), 2.0)
+                delay = random.uniform(delay * 0.75, delay * 1.25)
+                _logger.warning(
+                    "DB_TRANSACTION_RETRY operation=%s attempt=%d/%d delay_seconds=%.3f error=%s: %s",
+                    operation_name, attempt, attempts, delay, type(exc).__name__, exc,
+                )
+                time.sleep(delay)
     if last_error is not None:
         raise last_error
 
 
-def connect():
-    return _get_connection()
+def connect(operation: str = "database", *, autocommit: bool = False):
+    return _get_connection(operation, autocommit=autocommit)
+
+
+def run_autocommit(operation, *, operation_name: str = "database_autocommit"):
+    """Run statements in autocommit mode on a fresh connection.
+
+    Each statement commits independently. Use only where a caller can recover
+    from a later statement failing after an earlier statement has committed.
+    """
+    def _run():
+        with connect(operation_name, autocommit=True) as db:
+            return operation(db)
+    return _retry_db(_run, operation_name=operation_name)
+
+
+def run_transaction(operation, *, operation_name: str = "database_transaction"):
+    """Run one short transaction on a fresh connection, retrying transient busy errors."""
+    def _run():
+        with connect(operation_name) as db:
+            return operation(db)
+    return _retry_db(_run, operation_name=operation_name)
 
 
 def initialize() -> None:
     validate_configuration()
-    db = _get_connection()
+    db = _get_connection("initialize")
     try:
         _init_schema(db)
         migrations.run_migrations(db)
         db.commit()
+        _logger.info("DB_INITIALIZATION_COMPLETE backend=%s", settings.DATABASE_BACKEND)
+    except Exception:
+        _logger.exception("DB_INITIALIZATION_FAILED backend=%s", settings.DATABASE_BACKEND)
+        if bool(getattr(db, "in_transaction", False)):
+            try:
+                db.rollback()
+            except Exception:
+                _logger.exception("DB_INITIALIZATION_ROLLBACK_FAILED")
+        raise
     finally:
         db.close()
 
 
 def _init_schema(db) -> None:
-        try:
-            db.execute("""CREATE TABLE IF NOT EXISTS users (
+        db.execute("""CREATE TABLE IF NOT EXISTS users (
                 id INTEGER PRIMARY KEY AUTOINCREMENT, email TEXT NOT NULL UNIQUE,
                 name TEXT NOT NULL, hashed_password TEXT NOT NULL, role TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'active', department TEXT, created_at TEXT NOT NULL,
@@ -275,33 +431,6 @@ def _init_schema(db) -> None:
                 totp_cooldown_until TEXT,
                 totp_last_used_step TEXT
             )""")
-        except Exception:
-            pass
-        # Add columns if they don't exist (for migration)
-        try:
-            db.execute("ALTER TABLE users ADD COLUMN totp_secret_encrypted TEXT")
-        except Exception:
-            pass
-        try:
-            db.execute("ALTER TABLE users ADD COLUMN totp_enabled INTEGER NOT NULL DEFAULT 0")
-        except Exception:
-            pass
-        try:
-            db.execute("ALTER TABLE users ADD COLUMN totp_enrolled INTEGER NOT NULL DEFAULT 0")
-        except Exception:
-            pass
-        try:
-            db.execute("ALTER TABLE users ADD COLUMN totp_failed_attempts INTEGER NOT NULL DEFAULT 0")
-        except Exception:
-            pass
-        try:
-            db.execute("ALTER TABLE users ADD COLUMN totp_cooldown_until TEXT")
-        except Exception:
-            pass
-        try:
-            db.execute("ALTER TABLE users ADD COLUMN totp_last_used_step TEXT")
-        except Exception:
-            pass
         db.execute("""CREATE TABLE IF NOT EXISTS totp_login_challenges (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             challenge_token TEXT NOT NULL UNIQUE,
@@ -338,19 +467,11 @@ def _init_schema(db) -> None:
             status TEXT NOT NULL DEFAULT 'draft', created_at TEXT NOT NULL,
             content_json TEXT NOT NULL DEFAULT '{}'
         )""")
-        try:
-            db.execute("ALTER TABLE papers ADD COLUMN created_by INTEGER REFERENCES users(id)")
-        except Exception:
-            pass
         db.execute("""CREATE TABLE IF NOT EXISTS pdf_reviews (
             subject TEXT NOT NULL, filename TEXT NOT NULL, review_status TEXT NOT NULL DEFAULT 'unreviewed',
             PRIMARY KEY(subject, filename)
         )""")
         db.execute("CREATE TABLE IF NOT EXISTS admins (email TEXT PRIMARY KEY, password_hash TEXT NOT NULL)")
-        try:
-            db.execute("ALTER TABLE admins ADD COLUMN access_mode TEXT NOT NULL DEFAULT 'edit'")
-        except Exception:
-            pass
         db.execute("""CREATE TABLE IF NOT EXISTS jobs (
             job_id TEXT PRIMARY KEY, subject TEXT NOT NULL, filename TEXT NOT NULL,
             status TEXT NOT NULL, stage TEXT NOT NULL, started_at TEXT NOT NULL,
@@ -474,38 +595,40 @@ def put_artifact(
 ) -> None:
     now = datetime.now(timezone.utc).isoformat()
     digest = hashlib.sha256(data).hexdigest()
-    with connect() as db:
-        existing = db.execute(
-            "SELECT checksum_sha256 FROM stored_artifacts WHERE document_id IS ? AND artifact_key=?",
-            (document_id, artifact_key),
-        ).fetchone()
-        if existing and existing["checksum_sha256"] == digest:
-            return
-        db.execute(
-            """INSERT INTO stored_artifacts(
+    def _write():
+        with connect("put_artifact") as db:
+            existing = db.execute(
+                "SELECT checksum_sha256 FROM stored_artifacts WHERE document_id IS ? AND artifact_key=?",
+                (document_id, artifact_key),
+            ).fetchone()
+            if existing and existing["checksum_sha256"] == digest:
+                return
+            db.execute(
+                """INSERT INTO stored_artifacts(
                 artifact_id,subject_id,document_id,artifact_key,artifact_type,content_type,
                 checksum_sha256,size_bytes,data,metadata_json,created_at,updated_at
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
-            ON CONFLICT(document_id,artifact_key) DO UPDATE SET
-                subject_id=excluded.subject_id,artifact_type=excluded.artifact_type,
-                content_type=excluded.content_type,checksum_sha256=excluded.checksum_sha256,
-                size_bytes=excluded.size_bytes,data=excluded.data,
-                metadata_json=excluded.metadata_json,updated_at=excluded.updated_at""",
-            (
-                uuid.uuid4().hex,
-                subject_id,
-                document_id,
-                artifact_key,
-                artifact_type,
-                content_type,
-                digest,
-                len(data),
-                data,
-                json.dumps(metadata or {}, ensure_ascii=False),
-                now,
-                now,
-            ),
-        )
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(document_id,artifact_key) DO UPDATE SET
+                    subject_id=excluded.subject_id,artifact_type=excluded.artifact_type,
+                    content_type=excluded.content_type,checksum_sha256=excluded.checksum_sha256,
+                    size_bytes=excluded.size_bytes,data=excluded.data,
+                    metadata_json=excluded.metadata_json,updated_at=excluded.updated_at""",
+                (
+                    uuid.uuid4().hex,
+                    subject_id,
+                    document_id,
+                    artifact_key,
+                    artifact_type,
+                    content_type,
+                    digest,
+                    len(data),
+                    data,
+                    json.dumps(metadata or {}, ensure_ascii=False),
+                    now,
+                    now,
+                ),
+            )
+    _retry_db(_write, operation_name=f"put_artifact:{artifact_key}")
 
 
 def get_artifact(document_id: str, artifact_key: str) -> dict[str, Any] | None:
@@ -629,7 +752,7 @@ def save_job(job: dict[str, Any]) -> None:
     error = job.get("error")
     result_json = json.dumps(job.get("result")) if job.get("result") is not None else None
     def _write():
-        with connect() as db:
+        with connect("save_job") as db:
             db.execute(
                 "INSERT INTO jobs(job_id, subject, filename, status, stage, started_at, updated_at, error, result_json) "
                 "VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(job_id) DO UPDATE SET status=excluded.status, "
@@ -638,7 +761,7 @@ def save_job(job: dict[str, Any]) -> None:
                 (job_id, subject, filename, status, stage, started_at, now, error, result_json),
             )
             db.commit()
-    _retry_db(_write)
+    _retry_db(_write, operation_name=f"save_job:{job_id}")
 
 
 def get_job(job_id: str) -> dict[str, Any] | None:

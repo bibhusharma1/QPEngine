@@ -7,6 +7,7 @@ import logging
 import mimetypes
 import os
 import shutil
+import time
 import tempfile
 import threading
 from datetime import datetime, timezone
@@ -49,11 +50,12 @@ def _update(job: dict, *, status: str | None = None, stage: str | None = None,
 
 
 def _log(job: dict, message: str) -> None:
-    with database.connect() as db:
+    def _insert(db) -> None:
         db.execute(
             "INSERT INTO processing_logs(job_id,level,message,created_at) VALUES(?,?,?,?)",
             (job["job_id"], "INFO", message, datetime.now(timezone.utc).isoformat()),
         )
+    database.run_transaction(_insert, operation_name=f"processing_log:{job['job_id']}")
 
 
 def _rewrite_paths(root: Path, before: str, after: str) -> None:
@@ -174,11 +176,22 @@ def _run_lite_job(job: dict) -> None:
                     "SELECT artifact_key,data FROM stored_artifacts WHERE document_id=?",
                     (document["document_id"],),
                 ).fetchall()
+            cached_pages: dict[int, dict] = {}
             for artifact in cached:
                 target = parser_root / artifact["artifact_key"]
                 if target.resolve().is_relative_to(parser_root.resolve()):
                     target.parent.mkdir(parents=True, exist_ok=True)
                     target.write_bytes(bytes(artifact["data"]))
+                if artifact["artifact_key"].startswith("lite_pages/page-") and artifact["artifact_key"].endswith(".json"):
+                    try:
+                        page_number = int(Path(artifact["artifact_key"]).stem.split("-")[-1])
+                        page_payload = json.loads(bytes(artifact["data"]).decode("utf-8"))
+                        if isinstance(page_payload, dict) and str(
+                            page_payload.get("content") or page_payload.get("text") or ""
+                        ).strip():
+                            cached_pages[page_number] = page_payload
+                    except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
+                        logger.warning("Ignoring invalid cached Lite extraction artifact: %s", artifact["artifact_key"])
             try:
                 _update(job, status="running", stage="lite_extraction")
                 _log(job, "Lite mode: Nemotron extraction started")
@@ -192,11 +205,37 @@ def _run_lite_job(job: dict) -> None:
                 def update_question_progress(progress: dict) -> None:
                     _update(job, stage="lite_structuring", result={"progress": progress})
 
+                def persist_extracted_page(page_number: int, raw: dict, extraction_seconds: float) -> None:
+                    key = f"lite_pages/page-{page_number:05d}.json"
+                    payload = json.dumps(raw, ensure_ascii=False).encode("utf-8")
+                    local_page = parser_root / key
+                    local_page.parent.mkdir(parents=True, exist_ok=True)
+                    local_page.write_bytes(payload)
+                    started = time.monotonic()
+                    try:
+                        database.put_artifact(
+                            subject_id=document["subject_id"],
+                            document_id=document["document_id"],
+                            artifact_key=key,
+                            artifact_type="lite_page_extraction",
+                            content_type="application/json",
+                            data=payload,
+                            metadata={"page": page_number, "state": "persisted",
+                                      "extraction_seconds": extraction_seconds},
+                        )
+                    except Exception:
+                        _log(job, f"Lite page {page_number}: persistence failed after successful extraction; result remains in process memory")
+                        raise
+                    persistence_seconds = time.monotonic() - started
+                    _log(job, f"Lite page {page_number}: state=persisted extraction_seconds={extraction_seconds:.3f} database_persistence_seconds={persistence_seconds:.3f}")
+
                 extracted, bank_data = proc.process(
                     source,
                     output_dir=parser_root,
                     on_structuring=mark_structuring_started,
                     on_event=lambda message: _log(job, message),
+                    on_page_extracted=persist_extracted_page,
+                    cached_page_results=cached_pages,
                     on_question_progress=update_question_progress,
                     default_priority=int(job.get("default_priority") or 1),
                 )

@@ -272,6 +272,10 @@ class _InvalidModelOutput(ValueError):
     pass
 
 
+class _DatabasePersistenceError(RuntimeError):
+    """A persistence failure; it must never be retried as a model response."""
+
+
 class _GenerationRequestError(RuntimeError):
     def __init__(self, category: str, message: str, *, retryable: bool, status_code: int | None = None,
                  retry_after: float | None = None):
@@ -750,14 +754,6 @@ def _scope_hierarchy(scope: list[dict]) -> list[dict]:
             topic["description"] = entry["description"]
         section["topics"].append(topic)
     return modules
-
-
-def _generation_request_identity(request: dict) -> str:
-    transient = {"syllabus_summary", "selected_modules", "selected_topics", "resolved_scope",
-                 "resolved_hierarchy", "resolved_guidance", "generation_context_id",
-                 "calculated_total_questions", "calculated_total_marks"}
-    stable = {key: value for key, value in request.items() if key not in transient}
-    return _safe_json({key: stable[key] for key in sorted(stable)})
 
 
 def _topic_generation_guidance(syllabus: dict, item: dict) -> dict:
@@ -1646,46 +1642,51 @@ def create_job(*, user: str, subject_id: str, syllabus_id: str, request: dict,
     if total_count < 1 or total_count > 300: raise ValueError("Total requested questions must be between 1 and 300.")
     request["calculated_total_questions"] = total_count
     request["calculated_total_marks"] = total_marks
-    request_identity = _generation_request_identity(request)
     request["generation_context_id"] = uuid.uuid4().hex
     job_id, stamp = uuid.uuid4().hex, now()
     position = 0
-    with database.connect() as db:
-        active_result = db.execute("""SELECT job_id,request_json FROM question_generation_jobs
-            WHERE created_by=? AND subject_id=? AND syllabus_id=? AND status IN ('queued','running')
-            ORDER BY created_at DESC""", (user, subject_id, syllabus_id))
-        active_jobs = active_result.fetchall() if hasattr(active_result, "fetchall") else []
-        for active in active_jobs:
-            try:
-                if _generation_request_identity(json.loads(active["request_json"])) == request_identity:
-                    return str(active["job_id"])
-            except (TypeError, ValueError, KeyError):
-                continue
+    item_rows = []
+    for section in sections:
+        topics = scope
+        if not topics:
+            raise ValueError(f"Section {section['name']!r} has no selected syllabus topics.")
+        for _index in range(int(section["question_count"])):
+            source_index = min(len(topics) - 1, ((2 * position + 1) * len(topics)) // (2 * total_count))
+            source = topics[source_index]
+            item_rows.append((uuid.uuid4().hex, job_id, str(section["name"]), source["topic"],
+                int(section["marks_per_question"]), str(section["question_type"]), str(section["difficulty"]),
+                source["module_name"], source["heading"], position, stamp, stamp))
+            position += 1
+
+    def _create(db):
         db.execute("""INSERT INTO question_generation_jobs(job_id,created_by,subject_id,syllabus_id,status,
             request_json,progress_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)""",
             (job_id,user,subject_id,syllabus_id,"queued",_safe_json(request),"{}",stamp,stamp))
-        for section in sections:
-            topics = scope
-            if not topics:
-                raise ValueError(f"Section {section['name']!r} has no selected syllabus topics.")
-            question_count = int(section["question_count"])
-            for _index in range(question_count):
-                # Distribute questions across the whole paper so separate
-                # exam sections do not all restart at the same syllabus topic.
-                source_index = min(len(topics) - 1, ((2 * position + 1) * len(topics)) // (2 * total_count))
-                source = topics[source_index]
-                db.execute("""INSERT INTO question_generation_items(item_id,job_id,section,topic,marks,type,difficulty,
-                    source_module,source_heading,position,status,created_at,updated_at)
-                    VALUES(?,?,?,?,?,?,?,?,?,?,'queued',?,?)""",
-                    (uuid.uuid4().hex,job_id,str(section["name"]),source["topic"],int(section["marks_per_question"]),
-                     str(section["question_type"]),str(section["difficulty"]),source["module_name"],source["heading"],position,stamp,stamp))
-                position += 1
-    return job_id
+        db.executemany("""INSERT INTO question_generation_items(item_id,job_id,section,topic,marks,type,difficulty,
+            source_module,source_heading,position,status,created_at,updated_at)
+            VALUES(?,?,?,?,?,?,?,?,?,?,'queued',?,?)""", item_rows)
+        return job_id
+    return _qpg_transaction("smart_qpg_create_job", _create)
 
 
-def _update_progress(job_id: str, *, status: str | None = None, error: str | None = None) -> None:
-    stamp = now()
-    with database.connect() as db:
+def _qpg_transaction(operation_name: str, operation):
+    """Run a short Smart QPG transaction with bounded whole-transaction retries."""
+    try:
+        return database.run_transaction(operation, operation_name=operation_name)
+    except Exception as exc:
+        raise _DatabasePersistenceError(f"{operation_name} failed: {exc}") from exc
+
+
+def _qpg_autocommit(operation_name: str, operation):
+    """Run independent Smart QPG statements without retaining a Turso stream."""
+    try:
+        return database.run_autocommit(operation, operation_name=operation_name)
+    except Exception as exc:
+        raise _DatabasePersistenceError(f"{operation_name} failed: {exc}") from exc
+
+
+def _write_progress(db, job_id: str, *, stamp: str, status: str | None = None,
+                    error: str | None = None) -> dict:
         counts = {row["status"]: row["n"] for row in db.execute("SELECT status,COUNT(*) n FROM question_generation_items WHERE job_id=? GROUP BY status", (job_id,)).fetchall()}
         total = sum(counts.values())
         completed = sum(counts.get(s, 0) for s in ("draft", "approved", "rejected"))
@@ -1697,29 +1698,47 @@ def _update_progress(job_id: str, *, status: str | None = None, error: str | Non
         updates += ",error=?"; params.append(error)
         params.append(job_id)
         db.execute(f"UPDATE question_generation_jobs SET {updates} WHERE job_id=?", params)
+        return progress
+
+
+def _update_progress(job_id: str, *, status: str | None = None, error: str | None = None) -> None:
+    stamp = now()
+    _qpg_autocommit("smart_qpg_update_progress", lambda db: _write_progress(
+        db, job_id, stamp=stamp, status=status, error=error))
 
 
 def _set_item_state(job_id: str, item_id: str, status: str, *, question: dict | None = None,
                     error: str | None = None, retries: int | None = None) -> dict:
-    """Persist an item transition and matching progress snapshot atomically."""
+    """Persist item truth first, then refresh the recoverable progress snapshot."""
     stamp = now()
-    with database.connect() as db:
+    def _write(db):
         allowed_statuses = "status IN ('queued','failed','running')" if status == "running" else (
             "status='running'" if status in {"draft", "failed"} else "1=1")
         db.execute(f"""UPDATE question_generation_items SET status=?,question_json=?,error=?,
             retries=COALESCE(?,retries),updated_at=? WHERE job_id=? AND item_id=? AND {allowed_statuses}""",
                    (status, _safe_json(question) if question is not None else None, error, retries,
                     stamp, job_id, item_id))
+    _qpg_autocommit("smart_qpg_set_item_state", _write)
+    try:
+        _update_progress(job_id)
+    except _DatabasePersistenceError:
+        # The item transition is already durable. A progress snapshot is
+        # derived data and must not turn a successful generation into failure.
+        logger.exception("Could not refresh Smart QPG progress job_id=%s; recalculating from item states", job_id)
+        try:
+            _update_progress(job_id)
+        except _DatabasePersistenceError:
+            logger.exception("Could not persist recalculated Smart QPG progress job_id=%s", job_id)
+    def _read_counts(db):
         counts = {row["status"]: row["n"] for row in db.execute(
-            "SELECT status,COUNT(*) n FROM question_generation_items WHERE job_id=? GROUP BY status", (job_id,)).fetchall()}
+            "SELECT status,COUNT(*) n FROM question_generation_items WHERE job_id=? GROUP BY status",
+            (job_id,)).fetchall()}
         total = sum(counts.values())
-        completed = sum(counts.get(s, 0) for s in ("draft", "approved", "rejected"))
-        progress = {"total": total, "queued": counts.get("queued", 0), "running": counts.get("running", 0),
-                    "completed": completed, "failed": counts.get("failed", 0),
-                    "percentage_completed": int(completed * 100 / total) if total else 0, "counts": counts}
-        db.execute("UPDATE question_generation_jobs SET progress_json=?,updated_at=? WHERE job_id=?",
-                   (_safe_json(progress), stamp, job_id))
-    return progress
+        completed = sum(counts.get(value, 0) for value in ("draft", "approved", "rejected"))
+        return {"total": total, "queued": counts.get("queued", 0), "running": counts.get("running", 0),
+                "completed": completed, "failed": counts.get("failed", 0),
+                "percentage_completed": int(completed * 100 / total) if total else 0, "counts": counts}
+    return _qpg_autocommit("smart_qpg_read_progress_after_item_update", _read_counts)
 
 
 async def _generate_batch(client, job: dict, syllabus: dict | None, items: list[dict], examples: list[dict],
@@ -1892,7 +1911,9 @@ async def _generate_one(client, job: dict, syllabus: dict | None, item: dict, ex
             return result
         except Exception as exc:
             last_error = exc
-            if isinstance(exc, _GenerationRequestError):
+            if isinstance(exc, _DatabasePersistenceError):
+                retryable, category, retry_after = False, "database_persistence", None
+            elif isinstance(exc, _GenerationRequestError):
                 retryable = exc.retryable
                 category = exc.category
                 retry_after = exc.retry_after
@@ -1917,14 +1938,20 @@ async def _generate_one(client, job: dict, syllabus: dict | None, item: dict, ex
                 diagnostics["failure_category"] = category
                 diagnostics["failure_reason"] = _generation_error_detail(exc)
             if on_retry is not None:
-                await on_retry(next_retry, category, exc, delay)
+                try:
+                    await on_retry(next_retry, category, exc, delay)
+                except _DatabasePersistenceError as persist_exc:
+                    if diagnostics is not None:
+                        diagnostics["failure_category"] = "database_persistence"
+                        diagnostics["failure_reason"] = _generation_error_detail(persist_exc)
+                    raise
             if delay:
                 await asyncio.sleep(delay)
     raise last_error or RuntimeError("Question generation failed without an error detail.")
 
 
 def _load_generation_rows(job_id: str):
-    with database.connect() as db:
+    def _read(db):
         job_row = db.execute("""SELECT j.*,s.subject_name FROM question_generation_jobs j
             JOIN subjects s ON s.subject_id=j.subject_id WHERE job_id=?""", (job_id,)).fetchone()
         items = [dict(r) for r in db.execute(
@@ -1933,45 +1960,56 @@ def _load_generation_rows(job_id: str):
         saved_questions = [json.loads(r["question_json"]).get("question_text", "") for r in db.execute(
             "SELECT question_json FROM question_generation_items WHERE job_id=? AND status IN ('draft','approved') AND question_json IS NOT NULL",
             (job_id,)).fetchall()]
-    return dict(job_row) if job_row else None, items, saved_questions
+        return (dict(job_row) if job_row else None), items, saved_questions
+    return _qpg_transaction("smart_qpg_load_generation_rows", _read)
 
 
 def _job_state(job_id: str) -> str | None:
-    with database.connect() as db:
+    def _read(db):
         row = db.execute("SELECT status FROM question_generation_jobs WHERE job_id=?", (job_id,)).fetchone()
-    return row["status"] if row else None
+        return row["status"] if row else None
+    return _qpg_transaction("smart_qpg_read_job_state", _read)
 
 
 def _claim_job(job_id: str) -> bool:
     """Allow only one worker to execute a queued job, including across processes."""
-    with database.connect() as db:
+    def _claim(db):
         result = db.execute("UPDATE question_generation_jobs SET status='running',updated_at=? "
                             "WHERE job_id=? AND status='queued'", (now(), job_id))
         return bool(result.rowcount)
+    return _qpg_transaction("smart_qpg_claim_job", _claim)
 
 
 def _cancel_queued_items(job_id: str) -> None:
-    with database.connect() as db:
+    def _cancel(db):
         db.execute("UPDATE question_generation_items SET status='cancelled',updated_at=? WHERE job_id=? AND status IN ('queued','failed')",
                    (now(), job_id))
+    _qpg_transaction("smart_qpg_cancel_queued_items", _cancel)
 
 
 def _job_item_counts(job_id: str) -> tuple[dict[str, int], str | None]:
-    with database.connect() as db:
+    def _read(db):
         counts = {row["status"]: row["n"] for row in db.execute(
             "SELECT status,COUNT(*) n FROM question_generation_items WHERE job_id=? GROUP BY status", (job_id,)).fetchall()}
         row = db.execute("SELECT status FROM question_generation_jobs WHERE job_id=?", (job_id,)).fetchone()
-    return counts, row["status"] if row else None
+        return counts, row["status"] if row else None
+    return _qpg_transaction("smart_qpg_read_item_counts", _read)
 
 
 def _set_docx_error(job_id: str, error: str | None) -> None:
-    with database.connect() as db:
-        db.execute("UPDATE question_generation_jobs SET docx_error=?,updated_at=? WHERE job_id=?",
-                   (error, now(), job_id))
+    def _write(db):
+        if error is None:
+            db.execute("UPDATE question_generation_jobs SET docx_error=NULL,updated_at=? WHERE job_id=?",
+                       (now(), job_id))
+        else:
+            db.execute("UPDATE question_generation_jobs SET docx_error=?,status='partial',error=NULL,updated_at=? WHERE job_id=?",
+                       (error, now(), job_id))
+    _qpg_transaction("smart_qpg_set_docx_error", _write)
 
 
 async def run_job(job_id: str) -> None:
     client = None
+    docx_export_failed = False
     duplicate_lock = asyncio.Lock()
     progress_lock = asyncio.Lock()
     job_started = time.perf_counter()
@@ -2073,7 +2111,9 @@ async def run_job(job_id: str) -> None:
                     logger.exception("Could not persist generated question job_id=%s item_id=%s", job_id, item["item_id"])
                     progress = await change_item(item, "failed", error=f"Could not persist question: {exc}")
                     _generation_event("item_finished", job_id=job_id, item_id=item["item_id"],
-                        status="failed", retry_reason=str(exc)[:400], progress=progress)
+                        status="failed", failure_category=("database_persistence" if isinstance(exc, _DatabasePersistenceError)
+                                                             else "persistence_error"),
+                        retry_reason=str(exc)[:400], progress=progress)
 
         await asyncio.gather(*(process_item(item) for item in items))
         counts, final_state = await asyncio.to_thread(_job_item_counts, job_id)
@@ -2097,18 +2137,37 @@ async def run_job(job_id: str) -> None:
             docx_started = time.perf_counter()
             try:
                 await asyncio.to_thread(render_job_docx, job_id)
-                await asyncio.to_thread(_update_progress, job_id, status="completed", error=None)
+                try:
+                    await asyncio.to_thread(_update_progress, job_id, status="completed", error=None)
+                except Exception:
+                    # DOCX persistence already finalized the job atomically;
+                    # progress is derived from the durable item rows.
+                    logger.exception("Could not refresh completed Smart QPG progress job_id=%s", job_id)
                 _generation_event("job_docx_ready", job_id=job_id,
                                   duration_seconds=round(time.perf_counter() - docx_started, 3))
             except Exception as exc:
+                docx_export_failed = True
                 logger.exception("Could not automatically create completed question paper DOCX job_id=%s", job_id)
                 message = f"DOCX generation failed: {type(exc).__name__}: {exc}"
-                await asyncio.to_thread(_set_docx_error, job_id, message)
-                await asyncio.to_thread(_update_progress, job_id, status="failed", error=message)
+                # Question item rows are already durable drafts. Export is a
+                # separately recoverable finalization step and must not turn
+                # those successful generations into failed items/jobs.
+                try:
+                    await asyncio.to_thread(_set_docx_error, job_id, message)
+                except Exception:
+                    logger.exception("Could not persist DOCX failure state job_id=%s", job_id)
                 _generation_event("job_docx_failed", job_id=job_id,
                                   duration_seconds=round(time.perf_counter() - docx_started, 3),
                                   error=str(exc)[:400])
-        final = await asyncio.to_thread(_job_state, job_id)
+        try:
+            final = await asyncio.to_thread(_job_state, job_id)
+        except Exception:
+            if not docx_export_failed:
+                raise
+            # A transient DB outage after export failure must not rewrite the
+            # already-persisted question outcomes as a generation failure.
+            logger.exception("Could not reread Smart QPG state after DOCX failure job_id=%s", job_id)
+            final = "partial"
         _generation_event("job_worker_finished", job_id=job_id, status=final, item_counts=counts,
                           duration_seconds=round(time.perf_counter() - job_started, 3))
     except Exception as exc:
@@ -2134,33 +2193,40 @@ def start_job(job_id: str) -> None:
 
 def retry_job(job_id: str) -> bool:
     stamp = now()
-    with database.connect() as db:
+    def _retry(db):
         claimed = db.execute("UPDATE question_generation_jobs SET status='queued',error=NULL,updated_at=? "
                              "WHERE job_id=? AND status IN ('failed','partial','cancelled')", (stamp, job_id))
         if not claimed.rowcount:
             return False
         db.execute("UPDATE question_generation_items SET status='queued',error=NULL,updated_at=? WHERE job_id=? AND status IN ('failed','queued','running')", (stamp,job_id))
+        return True
+    if not _qpg_transaction("smart_qpg_retry_job", _retry):
+        return False
     _update_progress(job_id, status="queued", error=None)
     return True
 
 
 def cancel_job(job_id: str) -> bool:
     stamp = now()
-    with database.connect() as db:
+    def _cancel(db):
         cur = db.execute("UPDATE question_generation_jobs SET status='cancelling',updated_at=? WHERE job_id=? AND status IN ('queued','running','partial')", (stamp,job_id))
         db.execute("UPDATE question_generation_items SET status='cancelled',updated_at=? WHERE job_id=? AND status IN ('queued','failed')", (stamp,job_id))
-    if cur.rowcount:
+        return cur.rowcount > 0
+    cancelled = _qpg_transaction("smart_qpg_cancel_job", _cancel)
+    if cancelled:
         _update_progress(job_id, status="cancelling")
-    return cur.rowcount > 0
+    return cancelled
 
 
 def recover_interrupted_jobs() -> None:
     """Expose interrupted in-process work as retryable without touching saved drafts."""
     stamp = now()
-    with database.connect() as db:
+    def _recover(db):
         jobs = [row["job_id"] for row in db.execute("SELECT job_id FROM question_generation_jobs WHERE status IN ('queued','running','cancelling')").fetchall()]
         db.execute("UPDATE question_generation_items SET status='queued',updated_at=? WHERE status='running' AND job_id IN (SELECT job_id FROM question_generation_jobs WHERE status IN ('queued','running','cancelling'))", (stamp,))
         db.execute("UPDATE question_generation_jobs SET status='partial',error='Worker stopped before generation completed; retry pending questions.',updated_at=? WHERE status IN ('queued','running','cancelling')", (stamp,))
+        return jobs
+    jobs = _qpg_transaction("smart_qpg_recover_interrupted_jobs", _recover)
     for job_id in jobs:
         _update_progress(job_id, status="partial", error="Worker stopped before generation completed; retry pending questions.")
 
@@ -2260,11 +2326,12 @@ def _load_regeneration_data(job_id: str, item_id: str):
 
 def _persist_regenerated_question(job_id: str, item_id: str, question: dict) -> None:
     stamp = now()
-    with database.connect() as db:
+    def _write(db):
         db.execute("UPDATE question_generation_items SET question_json=?,status='draft',error=NULL,retries=retries+1,updated_at=? WHERE job_id=? AND item_id=?",
                    (_safe_json(question), stamp, job_id, item_id))
         db.execute("UPDATE question_generation_jobs SET docx_blob=NULL,updated_at=? WHERE job_id=?", (stamp, job_id))
         db.execute("DELETE FROM generated_papers WHERE paper_id=?", (job_id,))
+    _qpg_transaction("smart_qpg_persist_regenerated_question", _write)
 
 
 async def regenerate_item(job_id: str, item_id: str) -> dict:
@@ -2429,13 +2496,13 @@ def render_job_docx(job_id: str) -> bytes:
     for instruction in instructions:
         if instruction not in document_text:
             raise ValueError("The rendered DOCX is missing a general examination instruction.")
-    with database.connect() as db:
+    def _persist(db):
         stamp = now()
         db.execute("""INSERT OR REPLACE INTO generated_papers(
             paper_id,subject_name,storage_key,paper_json,docx_blob,created_at,updated_at)
             VALUES(?,?,?,?,?,?,?)""",
             (paper_id, subject["subject_name"], f"{paper_id}.docx", _safe_json(paper), content, stamp, stamp))
-        db.execute("UPDATE question_generation_jobs SET docx_blob=?,docx_error=NULL,updated_at=? WHERE job_id=?", (content, stamp, job_id))
-        db.commit()
+        db.execute("UPDATE question_generation_jobs SET docx_blob=?,docx_error=NULL,status='completed',error=NULL,updated_at=? WHERE job_id=?", (content, stamp, job_id))
+    _qpg_transaction("smart_qpg_persist_docx", _persist)
     return content
 

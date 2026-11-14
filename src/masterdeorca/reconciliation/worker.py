@@ -106,29 +106,19 @@ def _write_scheduler_state(state: dict) -> None:
 def _acquire_database_lease(owner: str) -> bool:
     now = datetime.now(timezone.utc)
     lease_until = (now + timedelta(seconds=LEASE_SECONDS)).isoformat()
-    with database.connect() as db:
-        db.execute("BEGIN IMMEDIATE")
-        row = db.execute(
-            "SELECT lease_owner,lease_until FROM scheduler_state WHERE state_key=?",
-            (SCHEDULER_STATE_KEY,),
-        ).fetchone()
-        if row and row["lease_owner"] and row["lease_until"]:
-            try:
-                active_until = datetime.fromisoformat(row["lease_until"])
-            except (TypeError, ValueError):
-                active_until = now
-            if active_until > now and row["lease_owner"] != owner:
-                return False
-        db.execute(
-            "UPDATE scheduler_state SET lease_owner=?,lease_until=?,updated_at=? WHERE state_key=?",
-            (owner, lease_until, now.isoformat(), SCHEDULER_STATE_KEY),
+    def _acquire(db):
+        result = db.execute(
+            "UPDATE scheduler_state SET lease_owner=?,lease_until=?,updated_at=? "
+            "WHERE state_key=? AND (lease_owner IS NULL OR lease_owner=? OR lease_until IS NULL OR lease_until<=?)",
+            (owner, lease_until, now.isoformat(), SCHEDULER_STATE_KEY, owner, now.isoformat()),
         )
-    return True
+        return bool(result.rowcount)
+    return database.run_transaction(_acquire, operation_name="reconciliation_acquire_lease")
 
 
 def _renew_database_lease(owner: str) -> None:
     now = datetime.now(timezone.utc)
-    with database.connect() as db:
+    def _renew(db):
         db.execute(
             "UPDATE scheduler_state SET lease_until=?,updated_at=? "
             "WHERE state_key=? AND lease_owner=?",
@@ -139,15 +129,17 @@ def _renew_database_lease(owner: str) -> None:
                 owner,
             ),
         )
+    database.run_transaction(_renew, operation_name="reconciliation_renew_lease")
 
 
 def _release_database_lease(owner: str) -> None:
-    with database.connect() as db:
+    def _release(db):
         db.execute(
             "UPDATE scheduler_state SET lease_owner=NULL,lease_until=NULL,updated_at=? "
             "WHERE state_key=? AND lease_owner=?",
             (_now(), SCHEDULER_STATE_KEY, owner),
         )
+    database.run_transaction(_release, operation_name="reconciliation_release_lease")
 
 
 def _lite_mode() -> bool:
@@ -593,7 +585,12 @@ def reconcile_all(force: bool = False) -> dict:
                 lease_thread.join(timeout=2)
     finally:
         if acquired_database_lease:
-            _release_database_lease(owner)
+            try:
+                _release_database_lease(owner)
+            except Exception:
+                # The lease has a finite expiry; never mask a reconciliation error
+                # with a failed best-effort release on a broken stream.
+                logger.exception("Could not release reconciliation database lease owner=%s", owner)
         run_lock.release()
 
 
@@ -635,7 +632,10 @@ def cleanup_question_bank_safety() -> dict:
         if lease_thread is not None:
             lease_thread.join(timeout=2)
         if acquired_database_lease:
-            _release_database_lease(owner)
+            try:
+                _release_database_lease(owner)
+            except Exception:
+                logger.exception("Could not release Question Bank cleanup database lease owner=%s", owner)
         _cleanup_lock.release()
 
 

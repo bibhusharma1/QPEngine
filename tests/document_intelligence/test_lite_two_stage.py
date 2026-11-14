@@ -18,6 +18,8 @@ from src.masterdeorca.document_intelligence.lite.two_stage import (
     _block_batches,
     _logical_block_batches,
     _classify_layout_blocks,
+    _classify_with_omission_recovery,
+    _supplement_missing_explicit_questions,
     _classify_blocks_adaptive,
     _supplement_explicit_table_questions,
 )
@@ -200,6 +202,98 @@ def test_adaptive_split_reuses_successful_child_when_sibling_fails():
         {"other_block_ids": ["a"]},
         {"other_block_ids": ["b"]},
     ]
+
+
+def test_omitted_block_recovery_keeps_successes_and_preserves_unresolved_text():
+    from src.masterdeorca.document_intelligence.lite.structurer import (
+        BlockReferenceValidationError,
+    )
+
+    blocks = [
+        {"block_id": "a", "page_number": 1, "reading_order": 1, "text": "Q.1 Explain alpha."},
+        {"block_id": "b", "page_number": 1, "reading_order": 2, "text": "Q.2 Explain beta."},
+        {"block_id": "c", "page_number": 2, "reading_order": 3, "text": "Q.3 Explain gamma."},
+    ]
+
+    def question(number, block_id):
+        return {"question_number": number, "block_ids": [block_id], "sub_questions": []}
+
+    class OmittingStructurer:
+        calls = []
+
+        def classify_blocks(self, request_blocks, _assets, *, batch_id, page_images=None):
+            ids = [block["block_id"] for block in request_blocks]
+            self.calls.append(ids)
+            if ids == ["a", "b", "c"]:
+                raise BlockReferenceValidationError(
+                    "omitted b,c", omitted_blocks=["b", "c"],
+                    partial_result={"questions": [question("Q1", "a")]},
+                )
+            if ids == ["b"]:
+                return {"questions": [question("Q2", "b")]}
+            raise BlockReferenceValidationError(
+                "omitted c", omitted_blocks=["c"], partial_result={"questions": []}
+            )
+
+    structurer = OmittingStructurer()
+    recovered = _classify_with_omission_recovery(
+        structurer, blocks, [], batch_id="omission-test", page_images=None
+    )
+    unclassified = next(item for item in recovered if item.get("unclassified_blocks"))
+    assert structurer.calls == [["a", "b", "c"], ["b"], ["c"]]
+    assert recovered[0]["questions"][0]["block_ids"] == ["a"]
+    assert recovered[1]["questions"][0]["block_ids"] == ["b"]
+    assert unclassified["unclassified_blocks"] == [blocks[2]]
+
+    block_map = {item["block_id"]: item for item in blocks}
+    candidates = _resolve_question_candidates(recovered, block_map, [])
+    candidates = _supplement_missing_explicit_questions(candidates, blocks, block_map, [])
+    assert {item["original_question_number"] for item in candidates} >= {"Q1", "Q2", "Q3"}
+    assert any("gamma" in item["original_text"] for item in candidates)
+
+
+def test_incomplete_stage2_unit_does_not_discard_other_unit_successes():
+    class OneUnitFails:
+        def classify_blocks(self, blocks, _assets, *, batch_id, page_images=None):
+            if blocks[0]["block_id"] == "b2":
+                raise RuntimeError("simulated incomplete batch")
+            return {"questions": [{"question_number": "Q1", "block_ids": ["b1"]}]}
+
+    blocks = [
+        {"block_id": "b1", "text": "Q.1 Explain alpha.", "page_number": 1},
+        {"block_id": "b2", "text": "Q.2 Explain beta.", "page_number": 1},
+    ]
+    classifications, _ = _classify_layout_blocks(
+        OneUnitFails(), blocks, [], page_images=None
+    )
+
+    assert any(item.get("questions") for item in classifications)
+    unresolved = [item for item in classifications if item.get("unclassified_blocks")]
+    assert unresolved[0]["unclassified_blocks"] == [blocks[1]]
+
+
+def test_persisted_page_results_resume_without_repeating_extraction(monkeypatch, tmp_path):
+    captured = _setup(monkeypatch, ["Q.1 First", "Q.2 Second"])
+    monkeypatch.setattr("config.settings.LITE_STAGE2_CONCURRENCY", 1)
+    source = tmp_path / "paper.pdf"
+    source.write_bytes(b"%PDF-1.4")
+    output = tmp_path / "out"
+
+    def interrupted_persistence(page_number, _raw, _elapsed):
+        if page_number == 1:
+            raise RuntimeError("simulated database interruption")
+
+    with pytest.raises(RuntimeError, match="simulated database interruption"):
+        LiteTwoStageProcessor().process(
+            source, output_dir=output, on_page_extracted=interrupted_persistence
+        )
+
+    _, result = LiteTwoStageProcessor().process(source, output_dir=output)
+
+    assert len(captured["requests"]) == 2
+    assert (output / "lite_pages/page-00001.json").is_file()
+    assert (output / "lite_pages/page-00002.json").is_file()
+    assert len(result["questions"]) == 2
 
 
 @dataclass

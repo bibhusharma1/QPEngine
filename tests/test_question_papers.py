@@ -40,6 +40,74 @@ def test_blueprint_crud_validation_and_precedence(tmp_path, monkeypatch):
         assert client.get("/api/question-paper/blueprints/os-midterm").status_code == 404
 
 
+def test_assigned_staff_can_save_blueprint_without_repeating_sole_subject(tmp_path, monkeypatch):
+    from src.masterdeorca import database
+
+    with _client(tmp_path, monkeypatch) as client:
+        staff = client.post("/teachers", json={"name": "HOD", "email": "hod@example.com",
+                                                "department": "CSE", "password": "teaching1"})
+        assert staff.status_code == 201
+        database.set_teacher_subjects(staff.json()["id"], ["OperatingSys"])
+        login = client.post("/auth/login", json={"email": "hod@example.com", "password": "teaching1"})
+        assert login.status_code == 200
+        client.headers.update({"Authorization": f"Bearer {login.json()['access_token']}"})
+
+        response = client.post("/blueprints", json={"blueprint_id": "hod-os", "name": "OS exam",
+                                   "sections": [{"name": "Section A", "question_count": 1,
+                                                 "marks_per_question": 5}]})
+        assert response.status_code == 201, response.text
+        assert response.json().get("subject_id") is None
+        assert client.get("/blueprints/hod-os").status_code == 200
+        updated = client.put("/blueprints/hod-os", json={"blueprint_id": "hod-os", "name": "Updated",
+                                  "sections": [{"name": "Section A", "question_count": 1,
+                                                "marks_per_question": 5}]})
+        assert updated.status_code == 200, updated.text
+        assert updated.json().get("subject_id") is None
+
+
+def test_blueprints_are_shared_across_authenticated_users(tmp_path, monkeypatch):
+    with _client(tmp_path, monkeypatch) as client:
+        for email in ("user-a@example.com", "user-b@example.com"):
+            assert client.post("/teachers", json={"name": email, "email": email,
+                                                   "department": "CSE", "password": "teaching1"}).status_code == 201
+        login_a = client.post("/auth/login", json={"email": "user-a@example.com", "password": "teaching1"})
+        assert login_a.status_code == 200
+        client.headers.update({"Authorization": f"Bearer {login_a.json()['access_token']}"})
+        blueprint = {"blueprint_id": "shared-os", "name": "OS exam", "subject_id": "OperatingSys",
+                     "sections": [{"name": "Section A", "question_count": 1, "marks_per_question": 5}]}
+        saved = client.post("/blueprints", json=blueprint)
+        assert saved.status_code == 201, saved.text
+        client.headers.update({"Authorization": f"Bearer {login_a.json()['access_token']}"})
+        assert client.get("/blueprints/shared-os").json()["name"] == "OS exam"
+
+        login_b = client.post("/auth/login", json={"email": "user-b@example.com", "password": "teaching1"})
+        assert login_b.status_code == 200
+        client.headers.update({"Authorization": f"Bearer {login_b.json()['access_token']}"})
+        assert client.get("/blueprints/shared-os").status_code == 200
+        assert any(row["blueprint_id"] == "shared-os" for row in client.get("/blueprints").json()["items"])
+        patched = client.patch("/blueprints/shared-os", json={"name": "Renamed by B"})
+        assert patched.status_code == 200, patched.text
+        assert client.get("/blueprints/shared-os").json()["name"] == "Renamed by B"
+        copied = client.post("/blueprints/shared-os/duplicate", json={"blueprint_id": "shared-copy"})
+        assert copied.status_code == 201, copied.text
+        assert client.get("/blueprints/shared-copy").status_code == 200
+        assert client.delete("/blueprints/shared-os").json()["deleted"] is True
+        assert client.get("/blueprints/shared-os").status_code == 404
+
+        client.headers.update({"Authorization": f"Bearer {login_a.json()['access_token']}"})
+        assert client.get("/blueprints/shared-os").status_code == 404
+        assert client.get("/blueprints/shared-copy").json()["name"] == "Renamed by B (copy)"
+        assert client.delete("/blueprints/shared-copy").status_code == 200
+        client.headers.pop("Authorization")
+        assert client.get("/blueprints").status_code == 401
+        assert client.patch("/blueprints/shared-os", json={"name": "No auth"}).status_code == 401
+
+        # Administrative endpoints retain their separate role check.
+        assert client.post("/subjects", json={"name": "NotAllowed"}).status_code == 401
+        client.headers.update({"Authorization": f"Bearer {login_b.json()['access_token']}"})
+        assert client.post("/subjects", json={"name": "NotAllowed"}).status_code == 403
+
+
 def test_blueprint_persists_to_one_canonical_file_and_default_is_initialized(tmp_path, monkeypatch):
     from src.masterdeorca.services import question_papers
 

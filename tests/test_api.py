@@ -6,19 +6,30 @@ import uuid
 from contextlib import contextmanager
 from fastapi.testclient import TestClient
 
+from config import settings
 from src.masterdeorca import app as app_module
 from src.masterdeorca import database, storage
 
 
 @contextmanager
 def _client(tmp_path, monkeypatch):
-    monkeypatch.setattr(database, "DATABASE_PATH", tmp_path / "store" / "db.sqlite")
+    # The DB abstraction reads runtime settings; keep API tests on isolated
+    # local SQLite regardless of the developer's deployment environment.
+    monkeypatch.setattr(settings, "DATABASE_BACKEND", "sqlite")
+    monkeypatch.setattr(settings, "APP_ENV", "local")
+    monkeypatch.setattr(settings, "DATABASE_PATH", tmp_path / "store" / "db.sqlite")
     monkeypatch.setattr(database, "ADMIN_EMAIL", "admin@example.com")
     monkeypatch.setattr(database, "ADMIN_PASSWORD", "admin@123")
     monkeypatch.setattr(storage, "STORAGE_ROOT", tmp_path / "subjects")
     monkeypatch.setattr(app_module, "STORAGE_ROOT", tmp_path / "subjects")
     monkeypatch.setattr(app_module, "MAX_UPLOAD_BYTES", 1024)
     with TestClient(app_module.app) as client:
+        # Test deployments no longer bootstrap a default administrator; seed
+        # the authenticated principal explicitly in the isolated test DB.
+        with database.connect() as db:
+            db.execute("INSERT INTO users(email,name,hashed_password,role,status,created_at) VALUES(?,?,?,?,?,?)",
+                       ("admin@example.com", "Admin", database._password_hash.hash("admin@123"),
+                        "admin", "active", "test"))
         response = client.post("/auth/login", json={"email": "admin@example.com", "password": "admin@123"})
         assert response.status_code == 200
         client.headers.update({"Authorization": f"Bearer {response.json()['access_token']}"})

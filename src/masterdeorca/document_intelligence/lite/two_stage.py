@@ -710,7 +710,6 @@ def _classify_layout_blocks(
         + [int(block.get("page_number") or 0) for block in blocks]
         + [1]
     )
-    failures: list[tuple[int, BaseException]] = []
     for window_index in sorted(window_batches):
         pending = list(window_batches[window_index])
         window_start = window_index * 2 + 1
@@ -745,7 +744,7 @@ def _classify_layout_blocks(
                     page = request_pages[index]
                     batch, assets, images = request_payloads[index]
                     future = executor.submit(
-                        _classify_one_batch, structurer, batch, assets,
+                        _classify_with_omission_recovery, structurer, batch, assets,
                         batch_id=batch_ids[index], page_images=images,
                     )
                     active[future] = index
@@ -768,12 +767,15 @@ def _classify_layout_blocks(
                     try:
                         results[index] = future.result()
                     except BaseException as exc:
-                        failures.append((index, exc))
-                        logger.warning(
-                            "LITE_STAGE2_BLOCK_BATCH_FAILED: batch=%s index=%d/%d "
-                            "page=%d error_type=%s",
+                        failed_blocks = request_payloads[index][0]
+                        results[index] = _unclassified_result(failed_blocks, str(exc))
+                        logger.error(
+                            "LITE_STAGE2_BLOCK_BATCH_UNCLASSIFIED: batch=%s index=%d/%d "
+                            "page=%d block_ids=%s outcome=preserved_unclassified "
+                            "error_type=%s error=%s",
                             batch_ids[index], index + 1, len(batches), page,
-                            type(exc).__name__,
+                            [block.get("block_id") for block in failed_blocks],
+                            type(exc).__name__, exc,
                         )
                         continue
                     logger.info(
@@ -784,15 +786,12 @@ def _classify_layout_blocks(
             "STAGE2_PAGE_WINDOW_COMPLETE: pages=%d-%d requests=%d failed=%d "
             "max_active_global=%d max_active_page=%d",
             window_start, window_end, len(window_batches[window_index]),
-            sum(1 for index, _ in failures if window_index == (request_pages[index] - 1) // 2),
+            sum(
+                1 for index in window_batches[window_index]
+                if isinstance(results[index], dict) and results[index].get("unclassified_blocks")
+            ),
             max_active_global, max_active_page,
         )
-    if failures:
-        index, failure = failures[0]
-        raise RuntimeError(
-            f"Stage 2 failed for {len(failures)} question unit(s); "
-            f"first failed batch={batch_ids[index]}: {failure}"
-        ) from failure
     def flatten(items):
         for item in items:
             if isinstance(item, list):
@@ -822,6 +821,123 @@ def _classify_one_batch(
             blocks, assets, batch_id=batch_id, page_images=page_images
         )
     return structurer.classify_blocks(blocks, assets, batch_id=batch_id)
+
+
+def _unclassified_result(blocks: list[dict[str, Any]], reason: str) -> dict[str, Any]:
+    return {
+        "questions": [], "sections": [], "instruction_block_ids": [],
+        "other_block_ids": [], "ambiguous_block_ids": [],
+        "unclassified_blocks": [dict(block) for block in blocks],
+        "unclassified_reason": reason,
+    }
+
+
+def _classify_with_omission_recovery(
+    structurer: Any,
+    blocks: list[dict[str, Any]],
+    assets: list[dict[str, Any]],
+    *,
+    batch_id: str,
+    page_images: dict[int, bytes] | None,
+) -> list[Any]:
+    """Keep valid classifications and recursively retry only omitted blocks."""
+    from src.masterdeorca.document_intelligence.lite.structurer import (
+        BlockReferenceValidationError,
+    )
+
+    try:
+        return [_classify_one_batch(
+            structurer, blocks, assets, batch_id=batch_id, page_images=page_images
+        )]
+    except BlockReferenceValidationError as exc:
+        # A fabricated block or asset reference invalidates the response; do
+        # not salvage any part of it as trusted model output.
+        if exc.invalid_blocks or exc.invalid_assets:
+            raise
+        if not exc.omitted_blocks or not exc.partial_result:
+            raise
+        if len(exc.omitted_blocks) == 1 and "-omitted-" in batch_id:
+            raise exc
+        by_id = {str(block.get("block_id")): block for block in blocks}
+        missing = [by_id[block_id] for block_id in exc.omitted_blocks if block_id in by_id]
+        logger.warning(
+            "LITE_STAGE2_OMITTED_BLOCK_RECOVERY_START: batch=%s omitted_block_ids=%s "
+            "successful_block_ids=%s recovery=split",
+            batch_id,
+            exc.omitted_blocks,
+            sorted(set(by_id) - set(exc.omitted_blocks)),
+        )
+        recovered: list[Any] = [exc.partial_result]
+        if len(missing) > 1:
+            midpoint = len(missing) // 2
+            parts = (missing[:midpoint], missing[midpoint:])
+        else:
+            parts = (missing,)
+        for part_index, part in enumerate(parts, start=1):
+            child_id = f"{batch_id}-omitted-{part_index}"
+            try:
+                recovered.extend(_classify_with_omission_recovery(
+                    structurer, part, assets, batch_id=child_id,
+                    page_images=page_images,
+                ))
+            except Exception as recovery_error:
+                if len(part) == 1 and not _question_candidate_reason(part[0]):
+                    deterministic = _classify_nonquestion_blocks(part)
+                    recovered.append(deterministic)
+                    outcome = "deterministic_nonquestion_fallback"
+                else:
+                    recovered.append(_unclassified_result(part, str(recovery_error)))
+                    outcome = "preserved_unclassified"
+                logger.error(
+                    "LITE_STAGE2_OMITTED_BLOCK_RECOVERY_FAILED: batch=%s "
+                    "block_ids=%s outcome=%s error_type=%s error=%s",
+                    child_id, [b.get("block_id") for b in part], outcome,
+                    type(recovery_error).__name__, recovery_error,
+                )
+        logger.info(
+            "LITE_STAGE2_OMITTED_BLOCK_RECOVERY_COMPLETE: batch=%s "
+            "omitted_block_ids=%s recovered=%d",
+            batch_id, exc.omitted_blocks, len(recovered) - 1,
+        )
+        return recovered
+
+
+def _classify_blocks_adaptive(
+    structurer: Any,
+    blocks: list[dict[str, Any]],
+    assets: list[dict[str, Any]],
+    *,
+    batch_id: str,
+    min_batch_size: int = 1,
+    cache_lookup: Callable[[list[dict[str, Any]]], Any | None] | None = None,
+    cache_store: Callable[[list[dict[str, Any]], Any], None] | None = None,
+) -> list[Any]:
+    """Retry a failed oversized classification by splitting and caching children."""
+    cached = cache_lookup(blocks) if cache_lookup else None
+    if cached is not None:
+        return [cached]
+    try:
+        result = structurer.classify_blocks(blocks, assets, batch_id=batch_id)
+    except Exception:
+        if len(blocks) <= max(1, min_batch_size):
+            raise
+        midpoint = len(blocks) // 2
+        results = []
+        for suffix, child in (("a", blocks[:midpoint]), ("b", blocks[midpoint:])):
+            child_result = _classify_blocks_adaptive(
+                structurer, child, assets, batch_id=f"{batch_id}-{suffix}",
+                min_batch_size=min_batch_size, cache_lookup=cache_lookup,
+                cache_store=cache_store,
+            )
+            # Recursive form returns a list; flatten one level for this parent.
+            value = child_result[0] if len(child_result) == 1 else child_result
+            if cache_store:
+                cache_store(child, value)
+            results.append(value)
+        return results
+    if cache_store:
+        cache_store(blocks, result)
+    return [result]
 
 
 def _resolve_question_candidates(
@@ -1432,6 +1548,39 @@ def _fallback_candidates_from_blocks(
     return candidates
 
 
+def _supplement_missing_explicit_questions(
+    candidates: list[dict[str, Any]],
+    blocks: list[dict[str, Any]],
+    block_map: dict[str, dict[str, Any]],
+    figure_assets: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Recover numbered questions omitted by Stage 2 without inventing text."""
+    recovered = _fallback_candidates_from_blocks(blocks, block_map, figure_assets)
+    present = {
+        re.sub(r"[^a-z0-9]", "", str(
+            item.get("original_question_number") or item.get("label") or ""
+        ).casefold())
+        for item in candidates
+    }
+    added = []
+    for item in recovered:
+        key = re.sub(r"[^a-z0-9]", "", str(
+            item.get("original_question_number") or item.get("label") or ""
+        ).casefold())
+        if key and key not in present:
+            candidates.append(item)
+            added.append(item)
+            present.add(key)
+    if added:
+        logger.warning(
+            "STAGE2_EXPLICIT_QUESTION_RECOVERY: questions=%s block_ids=%s "
+            "outcome=source_text_fallback",
+            [item.get("original_question_number") for item in added],
+            [item.get("source_block_ids") for item in added],
+        )
+    return candidates
+
+
 _EXPLICIT_QUESTION_HEADING = re.compile(
     r"^\s*Q\s*\.?\s*(\d+)\s*(?:\(([a-z])\))?(?=\s|$|[.:)])",
     re.IGNORECASE,
@@ -1924,6 +2073,8 @@ class LiteTwoStageProcessor:
         output_dir: Path | None = None,
         on_structuring: Callable[[int], None] | None = None,
         on_event: Callable[[str], None] | None = None,
+        on_page_extracted: Callable[[int, dict[str, Any], float], None] | None = None,
+        cached_page_results: dict[int, dict[str, Any]] | None = None,
         on_question_progress: Callable[[dict[str, Any]], None] | None = None,
         default_priority: int = 1,
     ):
@@ -1974,6 +2125,7 @@ class LiteTwoStageProcessor:
         page_results_map: dict[int, dict[str, Any]] = {}
 
         def _parse_page(page_number: int, image_data: bytes) -> tuple[int, dict[str, Any]]:
+            import time
             mime = "image/jpeg" if image_data.startswith(b"\\xff\\xd8\\xff") else "image/png"
             extension = ".jpg" if mime == "image/jpeg" else ".png"
             image_name = f"page-{page_number:05d}{extension}"
@@ -1983,6 +2135,7 @@ class LiteTwoStageProcessor:
             )
             if on_event is not None:
                 on_event(f"Nemotron request page {page_number}/{len(images)} image={image_name} mime={mime}")
+            started = time.monotonic()
             try:
                 raw = self.nemotron.parse_page_image(
                     image_data, mime, page_number, filename=image_name
@@ -2004,12 +2157,38 @@ class LiteTwoStageProcessor:
                     f"Nemotron extraction returned empty content for page {page_number} "
                     f"image {image_name} of {path.name}"
                 )
+            extraction_seconds = time.monotonic() - started
+            if output is not None:
+                _atomic_json_write(output / "lite_pages" / f"page-{page_number:05d}.json", raw)
+            if on_page_extracted is not None:
+                on_page_extracted(page_number, raw, extraction_seconds)
             return page_number, raw
+
+        cached_page_results = cached_page_results or {}
+        if output is not None:
+            for local_page in (output / "lite_pages").glob("page-*.json"):
+                try:
+                    page_number = int(local_page.stem.split("-")[-1])
+                    raw_page = json.loads(local_page.read_text(encoding="utf-8"))
+                    if isinstance(raw_page, dict) and str(
+                        raw_page.get("content") or raw_page.get("text") or ""
+                    ).strip():
+                        cached_page_results.setdefault(page_number, raw_page)
+                except (ValueError, OSError, UnicodeDecodeError, json.JSONDecodeError):
+                    continue
+        for page_number, raw in cached_page_results.items():
+            if page_number in images and isinstance(raw, dict) and str(
+                raw.get("content") or raw.get("text") or ""
+            ).strip():
+                page_results_map[page_number] = raw
+                if on_event is not None:
+                    on_event(f"Lite page {page_number}: reusing persisted extraction")
 
         with ThreadPoolExecutor(max_workers=_concurrency()) as executor:
             futures = {
                 executor.submit(_parse_page, page_number, image_data): page_number
                 for page_number, image_data in images.items()
+                if page_number not in page_results_map
             }
             for future in as_completed(futures):
                 page_number, raw = future.result()
@@ -2084,6 +2263,10 @@ class LiteTwoStageProcessor:
             block_map,
             all_figure_assets,
         )
+        candidates = _supplement_missing_explicit_questions(
+            candidates, sorted(block_map.values(), key=lambda block: block["reading_order"]),
+            block_map, all_figure_assets,
+        )
         def count_subquestions(items: list[dict[str, Any]]) -> int:
             return sum(
                 len(children := item.get("sub_questions") or [])
@@ -2132,6 +2315,12 @@ class LiteTwoStageProcessor:
                 )
                 fallback_candidates = _resolve_question_candidates(
                     fallback_classifications,
+                    block_map,
+                    all_figure_assets,
+                )
+                fallback_candidates = _supplement_missing_explicit_questions(
+                    fallback_candidates,
+                    sorted(block_map.values(), key=lambda block: block["reading_order"]),
                     block_map,
                     all_figure_assets,
                 )

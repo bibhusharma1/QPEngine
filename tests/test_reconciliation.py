@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import patch
@@ -55,6 +56,19 @@ def _fake_parser(parsed: dict, stem: str):
         out.mkdir(parents=True, exist_ok=True)
         (out / "questions_parsed.json").write_text(json.dumps(parsed))
     return run
+
+
+def test_reconciliation_lease_acquire_and_release_uses_conditional_write():
+    db = sqlite3.connect(":memory:")
+    db.row_factory = sqlite3.Row
+    db.execute("CREATE TABLE scheduler_state(state_key TEXT PRIMARY KEY, lease_owner TEXT, lease_until TEXT, updated_at TEXT)")
+    db.execute("INSERT INTO scheduler_state(state_key) VALUES(?)", (worker.SCHEDULER_STATE_KEY,))
+    with patch.object(database, "connect", return_value=db):
+        assert worker._acquire_database_lease("worker-a")
+        assert not worker._acquire_database_lease("worker-b")
+        worker._release_database_lease("worker-a")
+        assert worker._acquire_database_lease("worker-b")
+    db.close()
 
 
 def _parse_only(*specs) -> list[dict]:

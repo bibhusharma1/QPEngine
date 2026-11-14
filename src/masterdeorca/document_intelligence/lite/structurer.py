@@ -151,11 +151,13 @@ class BlockReferenceValidationError(ValueError):
         invalid_blocks: list[str] | None = None,
         omitted_blocks: list[str] | None = None,
         invalid_assets: list[str] | None = None,
+        partial_result: dict[str, Any] | None = None,
     ):
         super().__init__(message)
         self.invalid_blocks = invalid_blocks or []
         self.omitted_blocks = omitted_blocks or []
         self.invalid_assets = invalid_assets or []
+        self.partial_result = partial_result
 
 
 _MARKS_ONLY_BLOCK = re.compile(
@@ -1003,6 +1005,7 @@ Associated figure assets:
         schema_correction_used = False
         reference_correction_attempts = 0
         failures: list[str] = []
+        last_reference_error: BlockReferenceValidationError | None = None
         schema = _classification_response_schema()
         explicit_numbers = {
             match.group(1)
@@ -1254,6 +1257,11 @@ Associated figure assets:
                         invalid_blocks=invalid_blocks,
                         omitted_blocks=omitted_blocks,
                         invalid_assets=invalid_assets,
+                        partial_result=(
+                            validated.model_dump(mode="json")
+                            if omitted_blocks and not invalid_blocks and not invalid_assets
+                            else None
+                        ),
                     )
                 if not validated.questions:
                     heading_blocks = [
@@ -1301,6 +1309,8 @@ Associated figure assets:
                 ) or "finish_reason=length" in str(exc).casefold()
                 schema_error = "validation failed" in str(exc).casefold()
                 reference_error = isinstance(exc, BlockReferenceValidationError)
+                if reference_error:
+                    last_reference_error = exc
                 retryable_status = (
                     exc.retryable
                     if isinstance(exc, StructuringFailure) and exc.kind == "api_error"
@@ -1404,6 +1414,14 @@ Associated figure assets:
                     time.sleep(_stage2_backoff(attempt))
                 else:
                     break
+        if last_reference_error is not None:
+            logger.warning(
+                "LITE_STAGE2_BLOCK_REFERENCE_RECOVERY_REQUIRED: batch=%s omitted_block_ids=%s "
+                "invalid_block_ids=%s invalid_asset_ids=%s",
+                batch_id, last_reference_error.omitted_blocks,
+                last_reference_error.invalid_blocks, last_reference_error.invalid_assets,
+            )
+            raise last_reference_error
         raise RuntimeError(
             f"NVIDIA block classification failed for batch {batch_id}: "
             + "; ".join(failures)
